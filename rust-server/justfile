@@ -1,0 +1,2 @@
+submit-sample:
+	curl http://localhost:4318 -v --data-binary @sample.json

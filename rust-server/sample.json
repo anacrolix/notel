@@ -1,0 +1,4 @@
+{"msg": "hi", "context": 3}
+
+{"type": "span", "id": "a"}
+{"type": "span", "id": "b", "parentSpan": "a"}
