@@ -66,7 +66,7 @@ impl Server {
                             .sqlite_conn
                             .lock()
                             .await
-                            .execute("insert into data (payload) values (jsonb(?))", &[payload])
+                            .execute("insert into data (payload) values (jsonb(?))", [payload])
                         {
                             error!(payload, ?err, "error inserting payload into store");
                             return StatusCode::INTERNAL_SERVER_ERROR;
