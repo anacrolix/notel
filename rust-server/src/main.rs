@@ -31,10 +31,19 @@ struct Server {
 impl Server {
     // Eventually this might return a list of items added, or a count, so that callers can throw
     // away what they know was committed.
-    async fn submit(&self, req: axum::http::Request<axum::body::Body>) -> StatusCode {
+    async fn submit(&self, req: axum::http::Request<axum::body::Body>) -> (StatusCode, String) {
+        let mut payloads_inserted = 0;
+        let status_code = self.submit_inner(req, &mut payloads_inserted).await;
+        info!(payloads_inserted, "submit handled ok");
+        (status_code, format!("{}", payloads_inserted))
+    }
+    async fn submit_inner(
+        &self,
+        req: axum::http::Request<axum::body::Body>,
+        payloads_inserted: &mut usize,
+    ) -> StatusCode {
         let mut body_data_stream = req.into_body().into_data_stream();
         let mut bytes = vec![];
-        let mut payloads_inserted = 0;
         while let Some(result) = body_data_stream.next().await {
             let new_bytes = match result {
                 Err(err) => {
@@ -53,6 +62,7 @@ impl Server {
                 match result {
                     Err(err) if err.is_eof() => {
                         // We need more data for a complete object.
+                        bytes.drain(..json_stream_deserializer.byte_offset());
                         break;
                     }
                     Err(err) => {
@@ -76,12 +86,11 @@ impl Server {
                             return StatusCode::INTERNAL_SERVER_ERROR;
                         }
                         last_offset = value_end_offset;
-                        payloads_inserted += 1;
+                        *payloads_inserted += 1;
                     }
                 }
             }
         }
-        info!(payloads_inserted, "submit handled ok");
         StatusCode::OK
     }
 }
