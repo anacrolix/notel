@@ -1,7 +1,6 @@
 use axum::http::StatusCode;
 use futures::StreamExt;
 use std::sync::Arc;
-
 use tracing::*;
 
 #[tokio::main]
@@ -19,7 +18,8 @@ async fn main() -> anyhow::Result<()> {
             axum::routing::post(|body| async move { server.submit(body).await }),
         )
         .layer(tower_layer);
-    // This is just the OTLP/HTTP port, because if we're using this we're probably not using OTLP.
+    // This is just the OTLP/HTTP port, because if we're using this we're probably not using OTLP. I
+    // want this to bind dual stack, but I don't see any obvious way to do it with one call.
     let listener = tokio::net::TcpListener::bind("[::]:4318").await?;
     Ok(axum::serve(listener, app).await?)
 }
@@ -29,6 +29,8 @@ struct Server {
 }
 
 impl Server {
+    // Eventually this might return a list of items added, or a count, so that callers can throw
+    // away what they know was committed.
     async fn submit(&self, req: axum::http::Request<axum::body::Body>) -> StatusCode {
         let mut body_data_stream = req.into_body().into_data_stream();
         let mut bytes = vec![];
@@ -62,6 +64,8 @@ impl Server {
                         let payload = &bytes[last_offset..value_end_offset];
                         // sqlite needs to be given text.
                         let payload = std::str::from_utf8(payload).unwrap();
+                        // Down the track this could be done in a separate thread, or under a
+                        // transaction each time we read a chunk.
                         if let Err(err) = self
                             .sqlite_conn
                             .lock()

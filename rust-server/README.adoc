@@ -1,0 +1,1 @@
+The server receives POSTs of distinct JSON objects that are injected directly into the sqlite database using sqlite3's JSONB support.
