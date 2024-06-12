@@ -9,10 +9,16 @@ async fn main() -> anyhow::Result<()> {
     env_logger::init();
     let sqlite_conn = tokio::sync::Mutex::new(rusqlite::Connection::open("telemetry.db")?);
     let server = Arc::new(Server { sqlite_conn });
-    let app = axum::Router::new().route(
-        "/",
-        axum::routing::post(|body| async move { server.submit(body).await }),
-    );
+    let tower_layer = tower_http::trace::TraceLayer::new_for_http()
+        .make_span_with(tower_http::trace::DefaultMakeSpan::new().include_headers(true))
+        .on_request(())
+        .on_body_chunk(());
+    let app = axum::Router::new()
+        .route(
+            "/",
+            axum::routing::post(|body| async move { server.submit(body).await }),
+        )
+        .layer(tower_layer);
     // This is just the OTLP/HTTP port, because if we're using this we're probably not using OTLP.
     let listener = tokio::net::TcpListener::bind("[::]:4318").await?;
     Ok(axum::serve(listener, app).await?)
@@ -26,6 +32,7 @@ impl Server {
     async fn submit(&self, req: axum::http::Request<axum::body::Body>) -> StatusCode {
         let mut body_data_stream = req.into_body().into_data_stream();
         let mut bytes = vec![];
+        let mut payloads_inserted = 0;
         while let Some(result) = body_data_stream.next().await {
             let new_bytes = match result {
                 Err(err) => {
@@ -65,10 +72,12 @@ impl Server {
                             return StatusCode::INTERNAL_SERVER_ERROR;
                         }
                         last_offset = value_end_offset;
+                        payloads_inserted += 1;
                     }
                 }
             }
         }
+        info!(payloads_inserted, "submit handled ok");
         StatusCode::OK
     }
 }
