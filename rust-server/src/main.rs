@@ -35,6 +35,7 @@ async fn iter_json_stream(
     mut on_payload: impl FnMut(&[u8]) -> anyhow::Result<()>,
 ) -> Result<(), (anyhow::Error, StatusCode)> {
     let mut bytes = vec![];
+    let mut last_eof_error = None;
     while let Some(result) = body_data_stream.next().await {
         let new_bytes = match result {
             Err(err) => {
@@ -53,6 +54,7 @@ async fn iter_json_stream(
         while let Some(result) = json_stream_deserializer.next() {
             match result {
                 Err(err) if err.is_eof() => {
+                    last_eof_error = Some(err);
                     break;
                 }
                 Err(err) => {
@@ -63,6 +65,7 @@ async fn iter_json_stream(
                     ));
                 }
                 Ok(serde::de::IgnoredAny) => {
+                    last_eof_error = None;
                     let value_end_offset = json_stream_deserializer.byte_offset();
                     let payload = &bytes[last_offset..value_end_offset];
                     if let Err(err) = on_payload(payload) {
@@ -78,7 +81,9 @@ async fn iter_json_stream(
         trace!(last_offset, "draining bytes to offset");
         bytes.drain(..last_offset);
     }
-    Ok(())
+    last_eof_error
+        .map(|eof_err| Err((anyhow!(eof_err), StatusCode::BAD_REQUEST)))
+        .unwrap_or(Ok(()))
 }
 
 impl Server {
@@ -128,12 +133,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_chunked_json_stream() -> anyhow::Result<()> {
-        env_logger::init();
+        let _ = env_logger::try_init();
         let inputs = [
             r#""#,
             r#"{"msg"#,
-            r#"": "hi", "context": 3}
-"#,
+            "\": \"hi\", \"context\": 3}\n",
             r#"
 {"type": "span", "id": "a"}
 {"type": "span", "id": "b", "parentSpan":"#,
@@ -151,6 +155,51 @@ mod tests {
         )
         .await
         .unwrap();
+        let output_strings = outputs
+            .into_iter()
+            .map(|bytes| std::str::from_utf8(&bytes).unwrap().to_string())
+            .collect::<Vec<_>>();
+        let expected_eq = vec![
+            r#"{"msg": "hi", "context": 3}"#,
+            r#"
+
+{"type": "span", "id": "a"}"#,
+            r#"
+{"type": "span", "id": "b", "parentSpan": "a"}"#,
+        ];
+        assert_eq!(output_strings.len(), expected_eq.len());
+        assert_eq!(output_strings, expected_eq);
+        Ok(())
+    }
+
+    #[tokio::test]
+    /// Ensure that starting a valid JSON value doesn't result in success.
+    async fn test_chunked_json_stream_trailing_garbage() -> anyhow::Result<()> {
+        let _ = env_logger::try_init();
+        let inputs = [
+            r#""#,
+            r#"{"msg"#,
+            "\": \"hi\", \"context\": 3}\n",
+            r#"
+{"type": "span", "id": "a"}
+{"type": "span", "id": "b", "parentSpan":"#,
+            r#""#,
+            r#" "a"}"#,
+            r#" {  "#,
+        ];
+        let mut outputs = vec![];
+        let result = iter_json_stream(
+            futures::stream::iter(inputs.map(|str| Ok(str.into()))),
+            |payload| {
+                outputs.push(payload.to_owned());
+                Ok(())
+            },
+        )
+        .await;
+        result
+            .as_ref()
+            .expect_err("should error on trailing json value");
+        dbg!(&result);
         let output_strings = outputs
             .into_iter()
             .map(|bytes| std::str::from_utf8(&bytes).unwrap().to_string())
