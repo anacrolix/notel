@@ -1,5 +1,7 @@
 use anyhow::{anyhow, Context};
 use axum::body::Bytes;
+use axum::extract::ws::{Message, WebSocket};
+use axum::extract::WebSocketUpgrade;
 use axum::http::StatusCode;
 use futures::{Stream, StreamExt};
 use std::sync::{Arc, Mutex};
@@ -17,7 +19,20 @@ async fn main() -> anyhow::Result<()> {
     let app = axum::Router::new()
         .route(
             "/",
-            axum::routing::post(|body| async move { server.submit(body).await }),
+            axum::routing::post({
+                let server = Arc::clone(&server);
+                move |body| async move { server.submit(body).await }
+            }),
+        )
+        .route(
+            "/",
+            axum::routing::get({
+                let server = Arc::clone(&server);
+                |ws_upgrade: WebSocketUpgrade| async move {
+                    ws_upgrade
+                        .on_upgrade(move |ws| async move { server.websocket_handler(ws).await })
+                }
+            }),
         )
         .layer(tower_layer);
     // This is just the OTLP/HTTP port, because if we're using this we're probably not using OTLP. I
@@ -87,6 +102,35 @@ async fn iter_json_stream(
 }
 
 impl Server {
+    async fn websocket_handler(&self, websocket: WebSocket) {
+        if let Err(err) = self.websocket_handler_err(websocket).await {
+            error!(?err, "error handling websocket");
+        }
+    }
+
+    async fn websocket_handler_err(&self, mut websocket: WebSocket) -> anyhow::Result<()> {
+        while let Some(result) = websocket.recv().await {
+            let message = result
+                .context("receiving websocket message")?;
+            match message {
+                Message::Close(reason) => {
+                    debug!(?reason, "websocket closed");
+                },
+                // Pings and pongs are apparently are handled for us by the library.
+                Message::Ping(_) | Message::Pong(_) => {},
+                // That should leave text and binary types, which we won't discriminate.
+                _ => {
+                    let payload = message
+                        .to_text()
+                        .context("converting payload to text")?;
+                    self.insert_payload(payload)?;
+
+                }
+            }
+        }
+        Ok(())
+    }
+
     // Eventually this might return a list of items added, or a count, so that callers can throw
     // away what they know was committed.
     async fn submit(&self, req: axum::http::Request<axum::body::Body>) -> (StatusCode, String) {
@@ -94,6 +138,18 @@ impl Server {
         let status_code = self.submit_inner(req, &mut payloads_inserted).await;
         info!(payloads_inserted, "submit handled ok");
         (status_code, format!("{}", payloads_inserted))
+    }
+
+    fn insert_payload(&self, payload: &str) -> anyhow::Result<()> {
+        // Down the track this could be done in a separate thread, or under a
+        // transaction each time we read a chunk.
+        self.sqlite_conn
+            .lock()
+            .unwrap()
+            .execute("insert into data (payload) values (jsonb(?))", [payload])
+            .context("inserting payload into store")?;
+        debug!(payload, "inserted payload into store");
+        Ok(())
     }
 
     async fn submit_inner(
@@ -105,13 +161,7 @@ impl Server {
         let result = iter_json_stream(body_data_stream, move |payload| {
             // sqlite needs to be given text.
             let payload = std::str::from_utf8(payload).unwrap();
-            // Down the track this could be done in a separate thread, or under a
-            // transaction each time we read a chunk.
-            self.sqlite_conn
-                .lock()
-                .unwrap()
-                .execute("insert into data (payload) values (jsonb(?))", [payload])
-                .context("inserting payload into store")?;
+            self.insert_payload(payload)?;
             *payloads_inserted += 1;
             Ok(())
         })
