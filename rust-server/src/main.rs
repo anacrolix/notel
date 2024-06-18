@@ -2,8 +2,10 @@ use anyhow::{anyhow, Context};
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::WebSocketUpgrade;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
+use chrono::SecondsFormat;
 use futures::{Stream, StreamExt};
+use serde_json::json;
 use std::sync::{Arc, Mutex};
 use tracing::*;
 
@@ -28,9 +30,10 @@ async fn main() -> anyhow::Result<()> {
             "/",
             axum::routing::get({
                 let server = Arc::clone(&server);
-                |ws_upgrade: WebSocketUpgrade| async move {
-                    ws_upgrade
-                        .on_upgrade(move |ws| async move { server.websocket_handler(ws).await })
+                |ws_upgrade: WebSocketUpgrade, headers: HeaderMap| async move {
+                    ws_upgrade.on_upgrade(move |ws| async move {
+                        server.websocket_handler(ws, headers).await
+                    })
                 }
             }),
         )
@@ -102,29 +105,29 @@ async fn iter_json_stream(
 }
 
 impl Server {
-    async fn websocket_handler(&self, websocket: WebSocket) {
-        if let Err(err) = self.websocket_handler_err(websocket).await {
+    async fn websocket_handler(&self, websocket: WebSocket, headers: HeaderMap) {
+        if let Err(err) = self.websocket_handler_err(websocket, headers).await {
             error!(?err, "error handling websocket");
         }
     }
 
-    async fn websocket_handler_err(&self, mut websocket: WebSocket) -> anyhow::Result<()> {
+    async fn websocket_handler_err(
+        &self,
+        mut websocket: WebSocket,
+        headers: HeaderMap,
+    ) -> anyhow::Result<()> {
         while let Some(result) = websocket.recv().await {
-            let message = result
-                .context("receiving websocket message")?;
+            let message = result.context("receiving websocket message")?;
             match message {
                 Message::Close(reason) => {
                     debug!(?reason, "websocket closed");
-                },
+                }
                 // Pings and pongs are apparently are handled for us by the library.
-                Message::Ping(_) | Message::Pong(_) => {},
+                Message::Ping(_) | Message::Pong(_) => {}
                 // That should leave text and binary types, which we won't discriminate.
                 _ => {
-                    let payload = message
-                        .to_text()
-                        .context("converting payload to text")?;
-                    self.insert_payload(payload)?;
-
+                    let payload = message.to_text().context("converting payload to text")?;
+                    self.insert_payload(payload, &headers)?;
                 }
             }
         }
@@ -140,15 +143,29 @@ impl Server {
         (status_code, format!("{}", payloads_inserted))
     }
 
-    fn insert_payload(&self, payload: &str) -> anyhow::Result<()> {
+    fn insert_payload(&self, payload: &str, headers: &HeaderMap) -> anyhow::Result<()> {
         // Down the track this could be done in a separate thread, or under a
         // transaction each time we read a chunk.
-        self.sqlite_conn
-            .lock()
-            .unwrap()
-            .execute("insert into data (payload) values (jsonb(?))", [payload])
-            .context("inserting payload into store")?;
-        debug!(payload, "inserted payload into store");
+        debug!(payload, "inserting payload into store");
+        let conn = self.sqlite_conn.lock().unwrap();
+        let now_datetime_string =
+            chrono::Local::now().to_rfc3339_opts(SecondsFormat::Millis, false);
+        // This is a multimap, so we might need to do our own serialization elsewhere.
+        let headers_string = format!("{:?}", headers);
+        debug!(?headers_string, "headers string");
+        let headers_value: serde_json::Value =
+            serde_json::from_str(&headers_string).context(headers_string)?;
+        let collector = json!({
+            "time": now_datetime_string,
+            "headers": headers_value,
+        });
+        // I expect down the track we'll have a collector stream ID and submit stuff like headers
+        // only once.
+        conn.execute(
+            "insert into data (payload, collector) values (jsonb(?), jsonb(?))",
+            rusqlite::params![payload, collector],
+        )
+        .context("inserting payload into store")?;
         Ok(())
     }
 
@@ -157,11 +174,12 @@ impl Server {
         req: axum::http::Request<axum::body::Body>,
         payloads_inserted: &mut usize,
     ) -> StatusCode {
+        let headers = req.headers().clone();
         let body_data_stream = req.into_body().into_data_stream();
         let result = iter_json_stream(body_data_stream, move |payload| {
             // sqlite needs to be given text.
             let payload = std::str::from_utf8(payload).unwrap();
-            self.insert_payload(payload)?;
+            self.insert_payload(payload, &headers)?;
             *payloads_inserted += 1;
             Ok(())
         })
