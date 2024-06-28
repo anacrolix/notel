@@ -4,15 +4,25 @@ use axum::extract::ws::{Message, WebSocket};
 use axum::extract::WebSocketUpgrade;
 use axum::http::{HeaderMap, StatusCode};
 use chrono::SecondsFormat;
+use futures::select;
+use futures::FutureExt;
 use futures::{Stream, StreamExt};
-use serde_json::json;
 use std::sync::{Arc, Mutex};
 use tracing::*;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     env_logger::init();
-    let sqlite_conn = Mutex::new(rusqlite::Connection::open("telemetry.db")?);
+    let mut sqlite_conn = rusqlite::Connection::open("telemetry.db")?;
+    let tx = sqlite_conn.transaction()?;
+    let user_version: u64 =
+        tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if user_version == 0 {
+        tx.execute_batch(include_str!("../proposed-schema.sql"))?;
+        tx.pragma_update(None, "user_version", 1)?;
+    }
+    tx.commit()?;
+    let sqlite_conn = Mutex::new(sqlite_conn);
     let server = Arc::new(Server { sqlite_conn });
     let tower_layer = tower_http::trace::TraceLayer::new_for_http()
         .make_span_with(tower_http::trace::DefaultMakeSpan::new().include_headers(true))
@@ -32,7 +42,7 @@ async fn main() -> anyhow::Result<()> {
                 let server = Arc::clone(&server);
                 |ws_upgrade: WebSocketUpgrade, headers: HeaderMap| async move {
                     ws_upgrade.on_upgrade(move |ws| async move {
-                        server.websocket_handler(ws, headers).await
+                        server.websocket_handler(ws, &headers).await
                     })
                 }
             }),
@@ -105,33 +115,106 @@ async fn iter_json_stream(
 }
 
 impl Server {
-    async fn websocket_handler(&self, websocket: WebSocket, headers: HeaderMap) {
+    async fn websocket_handler(&self, websocket: WebSocket, headers: &HeaderMap) {
         if let Err(err) = self.websocket_handler_err(websocket, headers).await {
             error!(?err, "error handling websocket");
         }
     }
 
-    async fn websocket_handler_err(
-        &self,
-        mut websocket: WebSocket,
-        headers: HeaderMap,
-    ) -> anyhow::Result<()> {
-        while let Some(result) = websocket.recv().await {
-            let message = result.context("receiving websocket message")?;
-            match message {
-                Message::Close(reason) => {
-                    debug!(?reason, "websocket closed");
-                }
-                // Pings and pongs are apparently are handled for us by the library.
-                Message::Ping(_) | Message::Pong(_) => {}
-                // That should leave text and binary types, which we won't discriminate.
-                _ => {
-                    let payload = message.to_text().context("converting payload to text")?;
-                    self.insert_payload(payload, &headers)?;
-                }
+    fn handle_message(&self, message: Message, stream_id: i64) -> anyhow::Result<()> {
+        match message {
+            Message::Close(reason) => {
+                debug!(stream_id, ?reason, "websocket closed");
+            }
+            // Pings and pongs are apparently are handled for us by the library.
+            Message::Ping(_) | Message::Pong(_) => {}
+            // That should leave text and binary types, which we won't discriminate.
+            _ => {
+                let payload = message.to_text().context("converting payload to text")?;
+                self.insert_event(payload, stream_id)?;
             }
         }
         Ok(())
+    }
+
+    async fn websocket_handler_err(
+        &self,
+        mut websocket: WebSocket,
+        headers: &HeaderMap,
+    ) -> anyhow::Result<()> {
+        let stream_id = self.new_stream(headers)?;
+        let mut counter = 0;
+        loop {
+            let (batch_count, last_recv_result) =
+                Self::receive_consecutive_websocket_messages(&mut websocket, |message| {
+                    self.handle_message(message, stream_id)
+                })
+                .await;
+            let ack_result = if batch_count != 0 {
+                counter += batch_count;
+                Self::acknowledge_inserted(&mut websocket, counter).await
+            } else {
+                Ok(())
+            };
+            match last_recv_result {
+                Err(err) => {
+                    return Err(err);
+                }
+                Ok(false) => {
+                    return Ok(());
+                }
+                Ok(true) => {}
+            }
+            ack_result.context("acknowledging received")?;
+        }
+    }
+
+    async fn receive_consecutive_websocket_messages(
+        websocket: &mut WebSocket,
+        handle: impl Fn(Message) -> anyhow::Result<()>,
+    ) -> (u64, anyhow::Result<bool>) {
+        let message = match websocket.recv().await {
+            Some(Ok(message)) => message,
+            None => {
+                return (0, Ok(false));
+            }
+            Some(Err(err)) => {
+                return (0, Err(err.into()));
+            }
+        };
+        match handle(message) {
+            Err(err) => {
+                return (0, Err(err));
+            }
+            Ok(()) => {}
+        };
+        let mut count = 1;
+        loop {
+            let option_recv = select! {
+                a = websocket.recv().fuse() => a,
+                default => break,
+            };
+            match option_recv {
+                Some(Ok(message)) => match handle(message) {
+                    Ok(()) => count += 1,
+                    Err(err) => {
+                        return (count, Err(err));
+                    }
+                },
+                None => return (count, Ok(false)),
+                Some(Err(err)) => {
+                    return (count, Err(err.into()));
+                }
+            }
+        }
+        (count, Ok(true))
+    }
+
+    async fn acknowledge_inserted(
+        websocket: &mut WebSocket,
+        counter: u64,
+    ) -> Result<(), axum::Error> {
+        websocket.send(Message::Text(counter.to_string())).await
     }
 
     // Eventually this might return a list of items added, or a count, so that callers can throw
@@ -143,27 +226,32 @@ impl Server {
         (status_code, format!("{}", payloads_inserted))
     }
 
-    fn insert_payload(&self, payload: &str, headers: &HeaderMap) -> anyhow::Result<()> {
-        // Down the track this could be done in a separate thread, or under a
-        // transaction each time we read a chunk.
-        debug!(payload, "inserting payload into store");
+    fn new_stream(&self, headers: &HeaderMap) -> anyhow::Result<i64> {
         let conn = self.sqlite_conn.lock().unwrap();
-        let now_datetime_string =
-            chrono::Local::now().to_rfc3339_opts(SecondsFormat::Millis, false);
         // This is a multimap, so we might need to do our own serialization elsewhere.
         let headers_string = format!("{:?}", headers);
         debug!(?headers_string, "headers string");
         let headers_value: serde_json::Value =
             serde_json::from_str(&headers_string).context(headers_string)?;
-        let collector = json!({
-            "time": now_datetime_string,
-            "headers": headers_value,
-        });
+        Ok(conn.query_row(
+            "insert into streams (headers, start_datetime) values (jsonb(?), datetime('now')) returning stream_id",
+            rusqlite::params![headers_value],
+            |row| row.get(0),
+        )?)
+    }
+
+    fn insert_event(&self, payload: &str, stream_id: i64) -> anyhow::Result<()> {
+        // Down the track this could be done in a separate thread, or under a
+        // transaction each time we read a chunk.
+        debug!(payload, "inserting payload into store");
+        let conn = self.sqlite_conn.lock().unwrap();
         // I expect down the track we'll have a collector stream ID and submit stuff like headers
         // only once.
         conn.execute(
-            "insert into data (payload, collector) values (jsonb(?), jsonb(?))",
-            rusqlite::params![payload, collector],
+            "\
+            insert into events (insert_datetime, payload, stream_id) \
+            values (datetime('now'), jsonb(?), ?)",
+            rusqlite::params![payload, stream_id],
         )
         .context("inserting payload into store")?;
         Ok(())
@@ -174,12 +262,18 @@ impl Server {
         req: axum::http::Request<axum::body::Body>,
         payloads_inserted: &mut usize,
     ) -> StatusCode {
-        let headers = req.headers().clone();
+        let stream_id = match self.new_stream(req.headers()) {
+            Err(err) => {
+                error!(?err, "creating new stream");
+                return StatusCode::INTERNAL_SERVER_ERROR;
+            }
+            Ok(ok) => ok,
+        };
         let body_data_stream = req.into_body().into_data_stream();
         let result = iter_json_stream(body_data_stream, move |payload| {
             // sqlite needs to be given text.
             let payload = std::str::from_utf8(payload).unwrap();
-            self.insert_payload(payload, &headers)?;
+            self.insert_event(payload, stream_id)?;
             *payloads_inserted += 1;
             Ok(())
         })
@@ -193,6 +287,11 @@ impl Server {
         }
         StatusCode::OK
     }
+}
+
+#[allow(dead_code)]
+fn sqlite_local_datetime_now_string() -> String {
+    chrono::Local::now().to_rfc3339_opts(SecondsFormat::Millis, false)
 }
 
 #[cfg(test)]
