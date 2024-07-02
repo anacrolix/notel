@@ -3,24 +3,25 @@ package telemetry
 import (
 	"context"
 	"errors"
-	"github.com/anacrolix/chansync"
-	"github.com/anacrolix/chansync/events"
-	"github.com/anacrolix/log"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
-	"nhooyr.io/websocket"
 	"slices"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/anacrolix/chansync"
+	"github.com/anacrolix/chansync/events"
+	"nhooyr.io/websocket"
 )
 
 type Writer struct {
 	// websocket and HTTP post are supported. Posting isn't very nice through Cloudflare.
 	Url *url.URL
 	// Logger for *this*. Probably don't want to loop it back to itself.
-	Logger log.Logger
+	Logger *slog.Logger
 	// The time between reconnects to the Url.
 	RetryInterval time.Duration
 
@@ -90,7 +91,7 @@ func (me *Writer) writer() {
 		if !me.writerWait() {
 			return
 		}
-		me.Logger.Levelf(log.Debug, "connecting")
+		me.Logger.DebugContext(me.ctx, "connecting")
 		wait := func() bool {
 			if strings.Contains(me.Url.Scheme, "ws") {
 				return me.websocket()
@@ -118,7 +119,7 @@ func (me *Writer) Close(reason string) error {
 	me.lazyInit()
 	me.closeReason = reason
 	me.closed.Set()
-	me.Logger.Levelf(log.Debug, "waiting for writer")
+	me.Logger.DebugContext(me.ctx, "waiting for writer")
 	close(me.buf)
 	go func() {
 		time.Sleep(5 * time.Second)
@@ -132,7 +133,7 @@ func (me *Writer) Close(reason string) error {
 func (me *Writer) websocket() (wait bool) {
 	conn, _, err := websocket.Dial(me.ctx, me.Url.String(), nil)
 	if err != nil {
-		me.Logger.Levelf(log.Error, "error dialing websocket: %v", err)
+		me.Logger.ErrorContext(me.ctx, "error dialing websocket: %v", err)
 		return true
 	}
 	defer func() {
@@ -149,23 +150,27 @@ func (me *Writer) websocket() (wait bool) {
 			ctx,
 			func(b []byte) error {
 				err := conn.Write(ctx, websocket.MessageText, b)
-				me.Logger.Levelf(log.Debug, "wrote %q: %v", b, err)
+				me.Logger.DebugContext(
+					ctx, "wrote websocket text message",
+					"bytes", b,
+					"err", err,
+				)
 				return err
 			},
 		)
 		if err != nil {
-			me.Logger.Levelf(log.Error, "payload writer failed: %v", err)
+			me.Logger.ErrorContext(ctx, "payload writer failed: %v", err)
 		}
 		// Notify that we're not sending anymore.
 		err = conn.Write(ctx, websocket.MessageBinary, nil)
 		if err != nil {
-			me.Logger.Levelf(log.Error, "writing end of stream: %v", err)
+			me.Logger.ErrorContext(ctx, "writing end of stream: %v", err)
 		}
 	}()
 	err = me.websocketReader(me.ctx, conn)
 	// Since we can't receive acks anymore, stop sending immediately.
 	cancel()
-	me.Logger.Levelf(log.Error, "reading from websocket: %v", err)
+	me.Logger.ErrorContext(me.ctx, "reading from websocket: %v", err)
 	return false
 }
 
@@ -175,7 +180,9 @@ func (me *Writer) websocketReader(ctx context.Context, conn *websocket.Conn) err
 		if err != nil {
 			return err
 		}
-		me.Logger.Levelf(log.Debug, "read from telemetry websocket: %q", string(data))
+		me.Logger.DebugContext(
+			ctx, "read from telemetry websocket",
+			"message bytes", string(data))
 	}
 }
 
@@ -190,20 +197,22 @@ func (me *Writer) streamPost() {
 			return err
 		})
 		if err != nil {
-			me.Logger.Levelf(log.Error, "http post payload writer failed: %v", err)
+			me.Logger.ErrorContext(ctx, "http post payload writer failed: %v", err)
 		}
 	}()
-	me.Logger.Levelf(log.Debug, "starting post")
+	me.Logger.DebugContext(ctx, "starting post")
 	// What's the content type for newline/ND/packed JSON streams?
 	resp, err := http.Post(me.Url.String(), "application/jsonl", r)
-	me.Logger.Levelf(log.Debug, "post returned")
+	me.Logger.DebugContext(ctx, "post returned")
 	r.Close()
 	if err != nil {
-		me.Logger.Levelf(log.Error, "error posting: %s", err)
+		me.Logger.ErrorContext(ctx, "error posting: %s", err)
 		return
 	}
 	if resp.StatusCode != http.StatusOK {
-		me.Logger.Levelf(log.Error, "unexpected status code: %v", resp.StatusCode)
+		me.Logger.ErrorContext(
+			ctx, "unexpected post response status code",
+			"status code", resp.StatusCode)
 	}
 	resp.Body.Close()
 }
@@ -213,13 +222,13 @@ func (me *Writer) payloadWriter(ctx context.Context, w func(b []byte) error) err
 		select {
 		case b, ok := <-me.buf:
 			if !ok {
-				me.Logger.Levelf(log.Debug, "buf closed")
+				me.Logger.DebugContext(ctx, "buf closed")
 				return nil
 			}
-			me.Logger.Levelf(log.Debug, "writing %v byte payload", len(b))
+			me.Logger.DebugContext(ctx, "writing payload", "len", len(b))
 			err := w(b)
 			if err != nil {
-				me.Logger.Levelf(log.Debug, "error writing payload: %s", err)
+				me.Logger.DebugContext(ctx, "error writing payload: %s", err)
 				me.retry = append(me.retry, b)
 				me.addPending.Broadcast()
 				return err
@@ -232,8 +241,8 @@ func (me *Writer) payloadWriter(ctx context.Context, w func(b []byte) error) err
 
 func (me *Writer) lazyInit() {
 	me.init.Do(func() {
-		if me.Logger.IsZero() {
-			me.Logger = log.Default
+		if me.Logger == nil {
+			me.Logger = slog.Default()
 		}
 		me.buf = make(chan []byte, 256)
 		me.ctx, me.cancel = context.WithCancel(context.Background())
@@ -253,7 +262,7 @@ func (me *Writer) Write(p []byte) (n int, err error) {
 		me.addPending.Broadcast()
 		return len(p), nil
 	default:
-		me.Logger.Levelf(log.Error, "payload lost")
+		me.Logger.ErrorContext(me.ctx, "payload lost")
 		return 0, errors.New("payload lost")
 	}
 }
