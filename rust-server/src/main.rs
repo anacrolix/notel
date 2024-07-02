@@ -4,19 +4,24 @@ use axum::extract::ws::{Message, WebSocket};
 use axum::extract::WebSocketUpgrade;
 use axum::http::{HeaderMap, StatusCode};
 use chrono::SecondsFormat;
-use futures::select;
 use futures::FutureExt;
+use futures::{select_biased};
 use futures::{Stream, StreamExt};
+use std::future::poll_fn;
 use std::sync::{Arc, Mutex};
+use std::task::Poll;
 use tracing::*;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     env_logger::init();
     let mut sqlite_conn = rusqlite::Connection::open("telemetry.db")?;
+    sqlite_conn.pragma_update(None, "foreign_keys", "on")?;
+    if !sqlite_conn.pragma_query_value(None, "foreign_keys", |row| row.get(0))? {
+        warn!("foreign keys not enabled");
+    }
     let tx = sqlite_conn.transaction()?;
-    let user_version: u64 =
-        tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    let user_version: u64 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if user_version == 0 {
         tx.execute_batch(include_str!("../proposed-schema.sql"))?;
         tx.pragma_update(None, "user_version", 1)?;
@@ -114,6 +119,11 @@ async fn iter_json_stream(
         .unwrap_or(Ok(()))
 }
 
+enum StreamRetry {
+    More,
+    Stop,
+}
+
 impl Server {
     async fn websocket_handler(&self, websocket: WebSocket, headers: &HeaderMap) {
         if let Err(err) = self.websocket_handler_err(websocket, headers).await {
@@ -121,20 +131,23 @@ impl Server {
         }
     }
 
-    fn handle_message(&self, message: Message, stream_id: i64) -> anyhow::Result<()> {
+    fn handle_message(&self, message: Message, stream_id: i64) -> anyhow::Result<StreamRetry> {
         match message {
             Message::Close(reason) => {
                 debug!(stream_id, ?reason, "websocket closed");
+                // Not sure if we should act on this or let the next recv return None?
+                Ok(StreamRetry::More)
             }
             // Pings and pongs are apparently are handled for us by the library.
-            Message::Ping(_) | Message::Pong(_) => {}
+            Message::Ping(_) | Message::Pong(_) => Ok(StreamRetry::More),
             // That should leave text and binary types, which we won't discriminate.
+            Message::Binary(vec) if vec.is_empty() => Ok(StreamRetry::Stop),
             _ => {
                 let payload = message.to_text().context("converting payload to text")?;
                 self.insert_event(payload, stream_id)?;
+                Ok(StreamRetry::More)
             }
         }
-        Ok(())
     }
 
     async fn websocket_handler_err(
@@ -158,12 +171,12 @@ impl Server {
             };
             match last_recv_result {
                 Err(err) => {
-                    return Err(err);
+                    break Err(err);
                 }
-                Ok(false) => {
-                    return Ok(());
+                Ok(StreamRetry::Stop) => {
+                    break Ok(());
                 }
-                Ok(true) => {}
+                Ok(StreamRetry::More) => {}
             }
             ack_result.context("acknowledging received")?;
         }
@@ -171,43 +184,43 @@ impl Server {
 
     async fn receive_consecutive_websocket_messages(
         websocket: &mut WebSocket,
-        handle: impl Fn(Message) -> anyhow::Result<()>,
-    ) -> (u64, anyhow::Result<bool>) {
-        let message = match websocket.recv().await {
-            Some(Ok(message)) => message,
-            None => {
-                return (0, Ok(false));
-            }
-            Some(Err(err)) => {
-                return (0, Err(err.into()));
-            }
-        };
-        match handle(message) {
-            Err(err) => {
-                return (0, Err(err));
-            }
-            Ok(()) => {}
-        };
-        let mut count = 1;
-        loop {
-            let option_recv = select! {
-                a = websocket.recv().fuse() => a,
-                default => break,
-            };
-            match option_recv {
-                Some(Ok(message)) => match handle(message) {
-                    Ok(()) => count += 1,
-                    Err(err) => {
-                        return (count, Err(err));
-                    }
-                },
-                None => return (count, Ok(false)),
-                Some(Err(err)) => {
-                    return (count, Err(err.into()));
+        handle: impl Fn(Message) -> anyhow::Result<StreamRetry>,
+    ) -> (u64, anyhow::Result<StreamRetry>) {
+        let mut count = 0;
+        let result = loop {
+            let mut nonblocking = poll_fn(|_cx| {
+                if count == 0 {
+                    Poll::Pending
+                } else {
+                    Poll::Ready(())
                 }
+            })
+            .fuse();
+            let option_recv = select_biased! {
+                a = websocket.recv().fuse() => a,
+                () = nonblocking => {
+                    assert!(count > 0);
+                    break Ok(StreamRetry::More);
+                }
+            };
+            match match option_recv {
+                Some(Ok(message)) => match handle(message) {
+                    Ok(more) => {
+                        count += 1;
+                        more
+                    }
+                    Err(err) => break Err(err),
+                },
+                Some(Err(err)) => {
+                    break Err(err.into());
+                }
+                None => break Ok(StreamRetry::Stop),
+            } {
+                StreamRetry::More => {}
+                StreamRetry::Stop => break Ok(StreamRetry::Stop),
             }
-        }
-        (count, Ok(true))
+        };
+        (count, result)
     }
 
     async fn acknowledge_inserted(
