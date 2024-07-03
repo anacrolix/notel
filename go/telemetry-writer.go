@@ -170,7 +170,13 @@ func (me *Writer) websocket() (wait bool) {
 	err = me.websocketReader(me.ctx, conn)
 	// Since we can't receive acks anymore, stop sending immediately.
 	cancel()
-	me.Logger.ErrorContext(me.ctx, "reading from websocket: %v", err)
+	if err != nil {
+		level := slog.LevelError
+		if errors.Is(err, io.EOF) {
+			level = slog.LevelDebug
+		}
+		me.Logger.Log(me.ctx, level, "reading from websocket", "err", err)
+	}
 	return false
 }
 
