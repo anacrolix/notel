@@ -3,6 +3,7 @@ package telemetry
 import (
 	"context"
 	"errors"
+	g "github.com/anacrolix/generics"
 	"io"
 	"log/slog"
 	"net/http"
@@ -24,6 +25,12 @@ type Writer struct {
 	Logger *slog.Logger
 	// The time between reconnects to the Url.
 	RetryInterval time.Duration
+	// Override the library specific dial options, which for now is probably just some light
+	// compression.
+	WebsocketDialOptions *websocket.DialOptions
+	// Extra headers sent after any protocol specific ones for transports that use HTTP. This is
+	// intended for stream context, values that apply to all events streamed.
+	StreamContextHttpHeader http.Header
 
 	// Lazy init guard.
 	init   sync.Once
@@ -129,9 +136,31 @@ func (me *Writer) Close(reason string) error {
 	return nil
 }
 
+func (me *Writer) websocketDialOptions() *websocket.DialOptions {
+	var opts websocket.DialOptions
+	if me.WebsocketDialOptions == nil {
+		opts.CompressionMode = websocket.CompressionContextTakeover
+	} else {
+		opts = *me.WebsocketDialOptions
+	}
+	opts.HTTPHeader = opts.HTTPHeader.Clone()
+	g.MakeMapIfNil(&opts.HTTPHeader)
+	addHttpHeaders(opts.HTTPHeader, me.StreamContextHttpHeader)
+	return &opts
+}
+
+// Add headers from `from` to `mut`. Note that `mut` should be non-nil.
+func addHttpHeaders(mut, from http.Header) {
+	for key, values := range from {
+		for _, value := range values {
+			mut.Add(key, value)
+		}
+	}
+}
+
 // wait is true if the caller should wait a while before retrying.
 func (me *Writer) websocket() (wait bool) {
-	conn, _, err := websocket.Dial(me.ctx, me.Url.String(), nil)
+	conn, _, err := websocket.Dial(me.ctx, me.Url.String(), me.websocketDialOptions())
 	if err != nil {
 		me.Logger.ErrorContext(me.ctx, "error dialing websocket: %v", err)
 		return true
@@ -206,9 +235,17 @@ func (me *Writer) streamPost() {
 			me.Logger.ErrorContext(ctx, "http post payload writer failed: %v", err)
 		}
 	}()
+	defer r.Close()
 	me.Logger.DebugContext(ctx, "starting post")
 	// What's the content type for newline/ND/packed JSON streams?
-	resp, err := http.Post(me.Url.String(), "application/jsonl", r)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, me.Url.String(), r)
+	if err != nil {
+		me.Logger.ErrorContext(ctx, "error creating post request: %v", err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/jsonl")
+	addHttpHeaders(req.Header, me.StreamContextHttpHeader)
+	resp, err := http.DefaultClient.Do(req)
 	me.Logger.DebugContext(ctx, "post returned")
 	r.Close()
 	if err != nil {
