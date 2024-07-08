@@ -4,8 +4,8 @@ use axum::extract::ws::{Message, WebSocket};
 use axum::extract::WebSocketUpgrade;
 use axum::http::{HeaderMap, StatusCode};
 use chrono::SecondsFormat;
+use futures::select_biased;
 use futures::FutureExt;
-use futures::{select_biased};
 use futures::{Stream, StreamExt};
 use std::future::poll_fn;
 use std::sync::{Arc, Mutex};
@@ -240,12 +240,9 @@ impl Server {
     }
 
     fn new_stream(&self, headers: &HeaderMap) -> anyhow::Result<i64> {
+        let headers_value = headers_to_json_value(headers)?;
         let conn = self.sqlite_conn.lock().unwrap();
         // This is a multimap, so we might need to do our own serialization elsewhere.
-        let headers_string = format!("{:?}", headers);
-        debug!(?headers_string, "headers string");
-        let headers_value: serde_json::Value =
-            serde_json::from_str(&headers_string).context(headers_string)?;
         Ok(conn.query_row(
             "insert into streams (headers, start_datetime) values (jsonb(?), datetime('now')) returning stream_id",
             rusqlite::params![headers_value],
@@ -302,6 +299,13 @@ impl Server {
     }
 }
 
+fn headers_to_json_value(headers: &HeaderMap) -> serde_json::Result<serde_json::Value> {
+    // This converts duplicate header values to an array, and seems to leave single header values
+    // alone. This is needed to fix JSON containing backslashes for some values when those should be
+    // valid objects.
+    http_serde::header_map::serialize(headers, serde_json::value::Serializer)
+}
+
 #[allow(dead_code)]
 fn sqlite_local_datetime_now_string() -> String {
     chrono::Local::now().to_rfc3339_opts(SecondsFormat::Millis, false)
@@ -309,7 +313,45 @@ fn sqlite_local_datetime_now_string() -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::iter_json_stream;
+    use axum::http::HeaderMap;
+    use serde_json::json;
+    use crate::{headers_to_json_value, iter_json_stream};
+
+    #[test]
+    fn test_headers_to_json() -> anyhow::Result<()> {
+        let mut headers = HeaderMap::new();
+        let path = "c:\\herp/some/path";
+        let object_value = json!({"cwd": path});
+        headers.append("x-client", object_value.to_string().parse()?);
+        let json = headers_to_json_value(&headers)?;
+        println!("{}", &json);
+        let conn = rusqlite::Connection::open_in_memory()?;
+        conn.execute_batch("create table a(b)")?;
+        conn.execute("insert into a values (jsonb(?))", [&json])?;
+        let cwd: String = conn.query_row("select b->>'x-client'->>'cwd' from a", [], |row|row.get(0))?;
+        assert_eq!(cwd, path);
+        Ok(())
+    }
+
+    #[test]
+    fn test_duplicated_header_names_to_json() -> anyhow::Result<()> {
+        let _ = env_logger::try_init();
+        let mut headers = HeaderMap::new();
+        let path1 = "c:\\path1";
+        let path2 = "c:\\path2";
+        headers.append("x-client", json!({"herp": path1}).to_string().parse()?);
+        headers.append("x-client", json!({"derp": path2}).to_string().parse()?);
+        let json = headers_to_json_value(&headers)?;
+        println!("{}", &json);
+        let conn = rusqlite::Connection::open_in_memory()?;
+        conn.execute_batch("create table a(b)")?;
+        conn.execute("insert into a values (jsonb(?))", [&json])?;
+        let first_value: String = conn.query_row("select b->>'x-client'->>0->>'herp' from a", [], |row|row.get(0))?;
+        assert_eq!(first_value, path1);
+        let second_value: String = conn.query_row("select b->>'x-client'->>1->>'derp' from a", [], |row|row.get(0))?;
+        assert_eq!(second_value, path2);
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_chunked_json_stream() -> anyhow::Result<()> {
