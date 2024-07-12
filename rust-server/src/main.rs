@@ -8,13 +8,17 @@ use futures::select_biased;
 use futures::FutureExt;
 use futures::{Stream, StreamExt};
 use std::future::poll_fn;
+use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use tracing::*;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    env_logger::init();
+    env_logger::Builder::from_default_env()
+        .format(|fmt, record| writeln!(fmt, "{} {}", record.level(), record.args()))
+        .init();
+    debug!("debug level test");
     let mut sqlite_conn = rusqlite::Connection::open("telemetry.db")?;
     sqlite_conn.pragma_update(None, "foreign_keys", "on")?;
     if !sqlite_conn.pragma_query_value(None, "foreign_keys", |row| row.get(0))? {
