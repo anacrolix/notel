@@ -4,6 +4,7 @@ go 1.22.3
 
 require (
 	github.com/anacrolix/chansync v0.4.0
+	github.com/anacrolix/generics v0.0.2
 	nhooyr.io/websocket v1.8.11
 )
 
@@ -13,4 +14,5 @@ require (
 	github.com/anacrolix/sync v0.3.0 // indirect
 	github.com/huandu/xstrings v1.2.0 // indirect
 	github.com/stretchr/testify v1.8.1 // indirect
+	golang.org/x/exp v0.0.0-20220428152302-39d4317da171 // indirect
 )
