@@ -127,7 +127,7 @@ enum StreamRetry {
 impl Server {
     async fn websocket_handler(&self, websocket: WebSocket, headers: &HeaderMap) {
         if let Err(err) = self.websocket_handler_err(websocket, headers).await {
-            error!(?err, "error handling websocket");
+            info!(%err, "error handling websocket");
         }
     }
 
@@ -150,6 +150,7 @@ impl Server {
         }
     }
 
+    /// Only returns receive errors. Logs acknowledgement errors (but still returns).
     async fn websocket_handler_err(
         &self,
         mut websocket: WebSocket,
@@ -163,12 +164,15 @@ impl Server {
                     self.handle_message(message, stream_id)
                 })
                 .await;
-            let ack_result = if batch_count != 0 {
+            if batch_count != 0 {
                 counter += batch_count;
-                Self::acknowledge_inserted(&mut websocket, counter).await
-            } else {
-                Ok(())
-            };
+                if let Err(err) = Self::acknowledge_inserted(&mut websocket, counter).await {
+                    // Report the acknowledgment error, which is pretty important, and return with
+                    // whatever the recv result was.
+                    error!(?err, "acknowledging received");
+                    break last_recv_result.map(|_| ());
+                }
+            }
             match last_recv_result {
                 Err(err) => {
                     break Err(err);
@@ -178,7 +182,6 @@ impl Server {
                 }
                 Ok(StreamRetry::More) => {}
             }
-            ack_result.context("acknowledging received")?;
         }
     }
 
