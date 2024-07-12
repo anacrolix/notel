@@ -313,9 +313,9 @@ fn sqlite_local_datetime_now_string() -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::{headers_to_json_value, iter_json_stream};
     use axum::http::HeaderMap;
     use serde_json::json;
-    use crate::{headers_to_json_value, iter_json_stream};
 
     #[test]
     fn test_headers_to_json() -> anyhow::Result<()> {
@@ -328,7 +328,8 @@ mod tests {
         let conn = rusqlite::Connection::open_in_memory()?;
         conn.execute_batch("create table a(b)")?;
         conn.execute("insert into a values (jsonb(?))", [&json])?;
-        let cwd: String = conn.query_row("select b->>'x-client'->>'cwd' from a", [], |row|row.get(0))?;
+        let cwd: String =
+            conn.query_row("select b->>'x-client'->>'cwd' from a", [], |row| row.get(0))?;
         assert_eq!(cwd, path);
         Ok(())
     }
@@ -346,9 +347,15 @@ mod tests {
         let conn = rusqlite::Connection::open_in_memory()?;
         conn.execute_batch("create table a(b)")?;
         conn.execute("insert into a values (jsonb(?))", [&json])?;
-        let first_value: String = conn.query_row("select b->>'x-client'->>0->>'herp' from a", [], |row|row.get(0))?;
+        let first_value: String =
+            conn.query_row("select b->>'x-client'->>0->>'herp' from a", [], |row| {
+                row.get(0)
+            })?;
         assert_eq!(first_value, path1);
-        let second_value: String = conn.query_row("select b->>'x-client'->>1->>'derp' from a", [], |row|row.get(0))?;
+        let second_value: String =
+            conn.query_row("select b->>'x-client'->>1->>'derp' from a", [], |row| {
+                row.get(0)
+            })?;
         assert_eq!(second_value, path2);
         Ok(())
     }
