@@ -1,3 +1,4 @@
+use std::fmt::{Debug, Display, Formatter};
 use anyhow::{anyhow, Context};
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket};
@@ -16,9 +17,20 @@ use tracing::*;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_default_env()
-        .format(|fmt, record| writeln!(fmt, "{} {}", record.level(), record.args()))
+        .format(|fmt, record| {
+            let level_style = fmt.default_level_style(record.level());
+            let localtime = chrono::Local::now();
+            writeln!(
+                fmt,
+                "[{} {level_style}{}{level_style:#} {}] {}",
+                localtime,
+                record.level(),
+                record.target(),
+                record.args()
+            )
+        })
         .init();
-    debug!("debug level test");
+    debug!(test_arg = "hi mom", "debug level test");
     let mut sqlite_conn = rusqlite::Connection::open("telemetry.db")?;
     sqlite_conn.pragma_update(None, "foreign_keys", "on")?;
     if !sqlite_conn.pragma_query_value(None, "foreign_keys", |row| row.get(0))? {
@@ -60,6 +72,8 @@ async fn main() -> anyhow::Result<()> {
     // This is just the OTLP/HTTP port, because if we're using this we're probably not using OTLP. I
     // want this to bind dual stack, but I don't see any obvious way to do it with one call.
     let listener = tokio::net::TcpListener::bind("[::]:4318").await?;
+    let listener_local_addr = listener.local_addr()?;
+    info!(?listener_local_addr, "serving http");
     Ok(axum::serve(listener, app).await?)
 }
 
@@ -128,10 +142,34 @@ enum StreamRetry {
     Stop,
 }
 
+#[derive(Debug)]
+enum Error {
+    Recv(axum::Error),
+    Handle(anyhow::Error),
+}
+
+impl Display for Error {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Recv(err) => Display::fmt(err, f),
+            Handle(err) => Display::fmt(err, f)
+        }
+    }
+}
+
+use Error::*;
+
 impl Server {
     async fn websocket_handler(&self, websocket: WebSocket, headers: &HeaderMap) {
         if let Err(err) = self.websocket_handler_err(websocket, headers).await {
-            info!(%err, "error handling websocket");
+            match err {
+                Recv(err) => {
+                    debug!(?err, "error receiving message");
+                }
+                Handle(err) => {
+                    error!(?err, "error handling message");
+                }
+            }
         }
     }
 
@@ -159,15 +197,17 @@ impl Server {
         &self,
         mut websocket: WebSocket,
         headers: &HeaderMap,
-    ) -> anyhow::Result<()> {
-        let stream_id = self.new_stream(headers)?;
+    ) -> Result<(), Error> {
+        let stream_id = self.new_stream(headers).map_err(Handle)?;
+        info!(stream_id, "started new stream");
         let mut counter = 0;
-        loop {
+        let result = loop {
             let (batch_count, last_recv_result) =
                 Self::receive_consecutive_websocket_messages(&mut websocket, |message| {
                     self.handle_message(message, stream_id)
                 })
                 .await;
+            info!(batch_count, stream_id, "inserted consecutive payloads");
             if batch_count != 0 {
                 counter += batch_count;
                 if let Err(err) = Self::acknowledge_inserted(&mut websocket, counter).await {
@@ -186,13 +226,22 @@ impl Server {
                 }
                 Ok(StreamRetry::More) => {}
             }
+        };
+        match &result {
+            Ok(()) => {
+                info!(stream_id, counter, "stream ended");
+            }
+            Err(err) => {
+                info!(stream_id, counter, %err, "stream ended");
+            }
         }
+        result
     }
 
     async fn receive_consecutive_websocket_messages(
         websocket: &mut WebSocket,
         handle: impl Fn(Message) -> anyhow::Result<StreamRetry>,
-    ) -> (u64, anyhow::Result<StreamRetry>) {
+    ) -> (u64, Result<StreamRetry, Error>) {
         let mut count = 0;
         let result = loop {
             let mut nonblocking = poll_fn(|_cx| {
@@ -216,10 +265,10 @@ impl Server {
                         count += 1;
                         more
                     }
-                    Err(err) => break Err(err),
+                    Err(err) => break Err(Error::Handle(err)),
                 },
                 Some(Err(err)) => {
-                    break Err(err.into());
+                    break Err(Error::Recv(err));
                 }
                 None => break Ok(StreamRetry::Stop),
             } {
