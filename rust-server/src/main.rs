@@ -200,7 +200,7 @@ impl Server {
     ) -> Result<(), Error> {
         let stream_id = self.new_stream(headers).map_err(Handle)?;
         info!(stream_id, "started new stream");
-        let mut counter = 0;
+        let mut total_events = 0;
         let result = loop {
             let (batch_count, last_recv_result) =
                 Self::receive_consecutive_websocket_messages(&mut websocket, |message| {
@@ -209,8 +209,8 @@ impl Server {
                 .await;
             info!(batch_count, stream_id, "inserted consecutive payloads");
             if batch_count != 0 {
-                counter += batch_count;
-                if let Err(err) = Self::acknowledge_inserted(&mut websocket, counter).await {
+                total_events += batch_count;
+                if let Err(err) = Self::acknowledge_inserted(&mut websocket, total_events).await {
                     // Report the acknowledgment error, which is pretty important, and return with
                     // whatever the recv result was.
                     error!(?err, "acknowledging received");
@@ -229,10 +229,10 @@ impl Server {
         };
         match &result {
             Ok(()) => {
-                info!(stream_id, counter, "stream ended");
+                info!(stream_id, total_events, "stream ended");
             }
             Err(err) => {
-                info!(stream_id, counter, %err, "stream ended");
+                info!(stream_id, total_events, %err, "stream ended");
             }
         }
         result
@@ -265,10 +265,10 @@ impl Server {
                         count += 1;
                         more
                     }
-                    Err(err) => break Err(Error::Handle(err)),
+                    Err(err) => break Err(Handle(err)),
                 },
                 Some(Err(err)) => {
-                    break Err(Error::Recv(err));
+                    break Err(Recv(err));
                 }
                 None => break Ok(StreamRetry::Stop),
             } {
