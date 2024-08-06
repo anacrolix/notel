@@ -162,7 +162,7 @@ func addHttpHeaders(mut, from http.Header) {
 func (me *Writer) websocket() (wait bool) {
 	conn, _, err := websocket.Dial(me.ctx, me.Url.String(), me.websocketDialOptions())
 	if err != nil {
-		me.Logger.ErrorContext(me.ctx, "error dialing websocket: %v", err)
+		me.Logger.ErrorContext(me.ctx, "error dialing websocket", "err", err)
 		return true
 	}
 	defer func() {
@@ -188,12 +188,12 @@ func (me *Writer) websocket() (wait bool) {
 			},
 		)
 		if err != nil {
-			me.Logger.ErrorContext(ctx, "payload writer failed: %v", err)
+			me.Logger.ErrorContext(ctx, "payload writer failed", "err", err)
 		}
 		// Notify that we're not sending anymore.
 		err = conn.Write(ctx, websocket.MessageBinary, nil)
 		if err != nil {
-			me.Logger.ErrorContext(ctx, "writing end of stream: %v", err)
+			me.Logger.ErrorContext(ctx, "writing end of stream", "err", err)
 		}
 	}()
 	err = me.websocketReader(me.ctx, conn)
@@ -232,7 +232,7 @@ func (me *Writer) streamPost() {
 			return err
 		})
 		if err != nil {
-			me.Logger.ErrorContext(ctx, "http post payload writer failed: %v", err)
+			me.Logger.ErrorContext(ctx, "http post payload writer failed", "err", err)
 		}
 	}()
 	defer r.Close()
@@ -240,7 +240,7 @@ func (me *Writer) streamPost() {
 	// What's the content type for newline/ND/packed JSON streams?
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, me.Url.String(), r)
 	if err != nil {
-		me.Logger.ErrorContext(ctx, "error creating post request: %v", err)
+		me.Logger.ErrorContext(ctx, "error creating post request", "err", err)
 		return
 	}
 	req.Header.Set("Content-Type", "application/jsonl")
@@ -249,7 +249,7 @@ func (me *Writer) streamPost() {
 	me.Logger.DebugContext(ctx, "post returned")
 	r.Close()
 	if err != nil {
-		me.Logger.ErrorContext(ctx, "error posting: %s", err)
+		me.Logger.ErrorContext(ctx, "error posting", "err", err)
 		return
 	}
 	if resp.StatusCode != http.StatusOK {
@@ -271,7 +271,7 @@ func (me *Writer) payloadWriter(ctx context.Context, w func(b []byte) error) err
 			me.Logger.DebugContext(ctx, "writing payload", "len", len(b))
 			err := w(b)
 			if err != nil {
-				me.Logger.DebugContext(ctx, "error writing payload: %s", err)
+				me.Logger.DebugContext(ctx, "error writing payload", "err", err)
 				me.retry = append(me.retry, b)
 				me.addPending.Broadcast()
 				return err
