@@ -26,7 +26,7 @@ func mainErr() (err error) {
 		// Should derive this from the default port somewhere.
 		Host: "localhost:4318",
 	}
-	if *urlStr == "" {
+	if *urlStr != "" {
 		_url, err = url.Parse(*urlStr)
 		if err != nil {
 			return err
