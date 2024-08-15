@@ -3,6 +3,7 @@ package telemetry
 import (
 	"context"
 	"errors"
+	"fmt"
 	g "github.com/anacrolix/generics"
 	"io"
 	"log/slog"
@@ -261,19 +262,31 @@ func (me *Writer) streamPost() {
 }
 
 func (me *Writer) payloadWriter(ctx context.Context, w func(b []byte) error) error {
+	write := func(b []byte) (err error) {
+		me.Logger.DebugContext(ctx, "writing payload", "len", len(b))
+		err = w(b)
+		if err != nil {
+			me.Logger.DebugContext(ctx, "error writing payload", "err", err)
+		}
+		return
+	}
 	for {
+		for len(me.retry) != 0 {
+			err := write(me.retry[0])
+			if err != nil {
+				return fmt.Errorf("error writing retry: %w", err)
+			}
+			me.retry = me.retry[1:]
+		}
 		select {
 		case b, ok := <-me.buf:
 			if !ok {
 				me.Logger.DebugContext(ctx, "buf closed")
 				return nil
 			}
-			me.Logger.DebugContext(ctx, "writing payload", "len", len(b))
-			err := w(b)
+			err := write(b)
 			if err != nil {
-				me.Logger.DebugContext(ctx, "error writing payload", "err", err)
 				me.retry = append(me.retry, b)
-				me.addPending.Broadcast()
 				return err
 			}
 		case <-ctx.Done():
@@ -287,7 +300,7 @@ func (me *Writer) lazyInit() {
 		if me.Logger == nil {
 			me.Logger = slog.Default()
 		}
-		me.buf = make(chan []byte, 256)
+		me.buf = make(chan []byte, 1024)
 		me.ctx, me.cancel = context.WithCancel(context.Background())
 		if me.RetryInterval == 0 {
 			me.RetryInterval = time.Minute
@@ -297,6 +310,8 @@ func (me *Writer) lazyInit() {
 	})
 }
 
+var errWriterClosed = errors.New("writer is closed")
+
 func (me *Writer) Write(p []byte) (n int, err error) {
 	me.lazyInit()
 	select {
@@ -304,8 +319,13 @@ func (me *Writer) Write(p []byte) (n int, err error) {
 	case me.buf <- slices.Clone(p):
 		me.addPending.Broadcast()
 		return len(p), nil
+	case <-me.closed.Done():
+		return 0, errWriterClosed
 	default:
-		me.Logger.ErrorContext(me.ctx, "payload lost")
+		if me.closed.IsSet() {
+			return 0, errWriterClosed
+		}
+		me.Logger.ErrorContext(me.ctx, "payload lost", "payload", p)
 		return 0, errors.New("payload lost")
 	}
 }
