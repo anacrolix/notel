@@ -1,21 +1,37 @@
-use std::fmt::{Debug, Display, Formatter};
-use anyhow::{anyhow, Context};
+mod conn;
+use conn::Connection;
+
+use anyhow::{anyhow, Context, Result};
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::WebSocketUpgrade;
 use axum::http::{HeaderMap, StatusCode};
 use chrono::SecondsFormat;
+use clap::Parser;
 use futures::select_biased;
 use futures::FutureExt;
 use futures::{Stream, StreamExt};
+use std::fmt::{Debug, Display, Formatter};
 use std::future::poll_fn;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use tracing::*;
 
+#[derive(clap::Parser)]
+struct Args {
+    #[arg(long)]
+    storage: Storage,
+}
+
+#[derive(Clone, clap::ValueEnum)]
+enum Storage {
+    Sqlite,
+    DuckDB,
+}
+
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> Result<()> {
     env_logger::Builder::from_default_env()
         .format(|fmt, record| {
             let level_style = fmt.default_level_style(record.level());
@@ -30,21 +46,11 @@ async fn main() -> anyhow::Result<()> {
             )
         })
         .init();
-    debug!(test_arg = "hi mom", "debug level test");
-    let mut sqlite_conn = rusqlite::Connection::open("telemetry.db")?;
-    sqlite_conn.pragma_update(None, "foreign_keys", "on")?;
-    if !sqlite_conn.pragma_query_value(None, "foreign_keys", |row| row.get(0))? {
-        warn!("foreign keys not enabled");
-    }
-    let tx = sqlite_conn.transaction()?;
-    let user_version: u64 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if user_version == 0 {
-        tx.execute_batch(include_str!("../proposed-schema.sql"))?;
-        tx.pragma_update(None, "user_version", 1)?;
-    }
-    tx.commit()?;
-    let sqlite_conn = Mutex::new(sqlite_conn);
-    let server = Arc::new(Server { sqlite_conn });
+    debug!(test_arg = "hi mum", "debug level test");
+    let args = Args::parse();
+    let server = Arc::new(Server {
+        db_conn: Mutex::new(<dyn Connection>::open(args.storage)?),
+    });
     let tower_layer = tower_http::trace::TraceLayer::new_for_http()
         .make_span_with(tower_http::trace::DefaultMakeSpan::new().include_headers(true))
         .on_request(())
@@ -77,13 +83,19 @@ async fn main() -> anyhow::Result<()> {
     Ok(axum::serve(listener, app).await?)
 }
 
+type SerializedHeaders = serde_json::Value;
+
+type StreamId = i64;
+
+type StreamEventIndex = u64;
+
 struct Server {
-    sqlite_conn: Mutex<rusqlite::Connection>,
+    db_conn: Mutex<Box<dyn Connection + Send>>,
 }
 
 async fn iter_json_stream(
     mut body_data_stream: impl Stream<Item = Result<Bytes, axum::Error>> + Unpin,
-    mut on_payload: impl FnMut(&[u8]) -> anyhow::Result<()>,
+    mut on_payload: impl FnMut(&[u8]) -> Result<()>,
 ) -> Result<(), (anyhow::Error, StatusCode)> {
     let mut bytes = vec![];
     let mut last_eof_error = None;
@@ -152,7 +164,7 @@ impl Display for Error {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Recv(err) => Display::fmt(err, f),
-            Handle(err) => Display::fmt(err, f)
+            Handle(err) => Display::fmt(err, f),
         }
     }
 }
@@ -164,16 +176,21 @@ impl Server {
         if let Err(err) = self.websocket_handler_err(websocket, headers).await {
             match err {
                 Recv(err) => {
-                    debug!(?err, "error receiving message");
+                    debug!(?err, "receiving message");
                 }
                 Handle(err) => {
-                    error!(?err, "error handling message");
+                    error!(?err, "handling message");
                 }
             }
         }
     }
 
-    fn handle_message(&self, message: Message, stream_id: i64) -> anyhow::Result<StreamRetry> {
+    fn handle_message(
+        &self,
+        message: Message,
+        stream_id: i64,
+        stream_event_index: &mut StreamEventIndex,
+    ) -> Result<StreamRetry> {
         match message {
             Message::Close(reason) => {
                 debug!(stream_id, ?reason, "websocket closed");
@@ -186,7 +203,8 @@ impl Server {
             Message::Binary(vec) if vec.is_empty() => Ok(StreamRetry::Stop),
             _ => {
                 let payload = message.to_text().context("converting payload to text")?;
-                self.insert_event(payload, stream_id)?;
+                self.insert_event(payload, stream_id, *stream_event_index)
+                    .context("inserting event")?;
                 Ok(StreamRetry::More)
             }
         }
@@ -198,13 +216,17 @@ impl Server {
         mut websocket: WebSocket,
         headers: &HeaderMap,
     ) -> Result<(), Error> {
-        let stream_id = self.new_stream(headers).map_err(Handle)?;
+        let stream_id = self
+            .new_stream(headers)
+            .context("creating new stream")
+            .map_err(Handle)?;
         info!(stream_id, "started new stream");
         let mut total_events = 0;
+        let mut stream_event_index = 0;
         let result = loop {
             let (batch_count, last_recv_result) =
                 Self::receive_consecutive_websocket_messages(&mut websocket, |message| {
-                    self.handle_message(message, stream_id)
+                    self.handle_message(message, stream_id, &mut stream_event_index)
                 })
                 .await;
             info!(batch_count, stream_id, "inserted consecutive payloads");
@@ -240,7 +262,7 @@ impl Server {
 
     async fn receive_consecutive_websocket_messages(
         websocket: &mut WebSocket,
-        handle: impl Fn(Message) -> anyhow::Result<StreamRetry>,
+        mut handle: impl FnMut(Message) -> Result<StreamRetry>,
     ) -> (u64, Result<StreamRetry, Error>) {
         let mut count = 0;
         let result = loop {
@@ -297,36 +319,28 @@ impl Server {
 
     fn new_stream(&self, headers: &HeaderMap) -> anyhow::Result<i64> {
         let headers_value = headers_to_json_value(headers)?;
-        let conn = self.sqlite_conn.lock().unwrap();
-        // This is a multimap, so we might need to do our own serialization elsewhere.
-        Ok(conn.query_row(
-            "insert into streams (headers, start_datetime) values (jsonb(?), datetime('now')) returning stream_id",
-            rusqlite::params![headers_value],
-            |row| row.get(0),
-        )?)
+        let conn = self.db_conn.lock().unwrap();
+        conn.new_stream(headers_value)
     }
 
-    fn insert_event(&self, payload: &str, stream_id: i64) -> anyhow::Result<()> {
+    fn insert_event(
+        &self,
+        payload: &str,
+        stream_id: StreamId,
+        stream_event_index: StreamEventIndex,
+    ) -> anyhow::Result<()> {
         // Down the track this could be done in a separate thread, or under a
         // transaction each time we read a chunk.
         debug!(payload, "inserting payload into store");
-        let conn = self.sqlite_conn.lock().unwrap();
-        // I expect down the track we'll have a collector stream ID and submit stuff like headers
-        // only once.
-        conn.execute(
-            "\
-            insert into events (insert_datetime, payload, stream_id) \
-            values (datetime('now'), jsonb(?), ?)",
-            rusqlite::params![payload, stream_id],
-        )
-        .context("inserting payload into store")?;
-        Ok(())
+        let conn = self.db_conn.lock().unwrap();
+        conn.insert_event(stream_id, stream_event_index, payload)
+            .context("inserting payload into store")
     }
 
     async fn submit_inner(
         &self,
         req: axum::http::Request<axum::body::Body>,
-        payloads_inserted: &mut usize,
+        payloads_inserted: &mut u64,
     ) -> StatusCode {
         let stream_id = match self.new_stream(req.headers()) {
             Err(err) => {
@@ -336,11 +350,14 @@ impl Server {
             Ok(ok) => ok,
         };
         let body_data_stream = req.into_body().into_data_stream();
+        let mut stream_event_index = 0;
         let result = iter_json_stream(body_data_stream, move |payload| {
             // sqlite needs to be given text.
             let payload = std::str::from_utf8(payload).unwrap();
-            self.insert_event(payload, stream_id)?;
+            self.insert_event(payload, stream_id, stream_event_index)?;
             *payloads_inserted += 1;
+            stream_event_index += 1;
+            assert_eq!(stream_event_index, *payloads_inserted);
             Ok(())
         })
         .await;
