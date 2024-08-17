@@ -69,22 +69,28 @@ impl JsonFileWriter {
     fn new(table: String) -> Result<Self> {
         Ok(Self { w: None, table })
     }
+    /// Flushes the compressed stream but keeps the file open for the next stream.
     fn flush(&mut self) -> Result<()> {
-        let Some(w) = &mut self.w else {
-            return Ok(());
-        };
-        // Finishes the zstd stream but not the file, making it data available to observers.
-        Ok(w.flush()?)
-    }
-    fn finish(&mut self) -> Result<()> {
-        let Some(w) = self.w.take() else {
-            return Ok(());
-        };
-        w.finish()?.flush()?;
+        if let Some(file) = self.finish_stream()? {
+            self.w = Some(Self::new_encoder(file)?)
+        }
         Ok(())
     }
+    fn finish_file(&mut self) -> Result<()> {
+        self.finish_stream()?;
+        Ok(())
+    }
+    fn finish_stream(&mut self) -> Result<Option<NamedTempFile>> {
+        let Some(w) = self.w.take() else {
+            return Ok(None);
+        };
+        Ok(Some(w.finish()?))
+    }
+    fn new_encoder(file: NamedTempFile) -> Result<zstd::Encoder<'static, NamedTempFile>> {
+        Ok(zstd::Encoder::new(file, 0)?)
+    }
     fn open(&mut self) -> Result<()> {
-        self.finish()?;
+        self.finish_file()?;
         let dir_path = "json_files";
         std::fs::create_dir_all(dir_path)?;
         let temp_file = tempfile::Builder::new()
@@ -94,7 +100,7 @@ impl JsonFileWriter {
             .keep(true)
             .tempfile_in(dir_path)
             .context("opening temp file")?;
-        self.w = Some(zstd::Encoder::new(temp_file, 0)?);
+        self.w = Some(Self::new_encoder(temp_file)?);
         Ok(())
     }
     fn write(&mut self) -> Result<impl Write + '_> {
@@ -107,7 +113,7 @@ impl JsonFileWriter {
 
 impl Drop for JsonFileWriter {
     fn drop(&mut self) {
-        self.finish().unwrap();
+        self.finish_file().unwrap();
     }
 }
 
@@ -168,6 +174,10 @@ struct JsonFiles {
     events: JsonFileWriter,
 }
 
+fn json_datetime_now() -> serde_json::Value {
+    json!(Utc::now().to_rfc3339())
+}
+
 impl Connection for JsonFiles {
     fn new_stream(&mut self, headers: SerializedHeaders) -> Result<StreamId> {
         let stream_id: StreamId = random();
@@ -190,6 +200,7 @@ impl Connection for JsonFiles {
         payload: &str,
     ) -> Result<()> {
         let line_json = json!({
+            "insert_datetime": json_datetime_now(),
             "stream_id": stream_id,
             "stream_event_index": stream_event_index,
             "payload": payload,
@@ -207,8 +218,8 @@ impl Connection for JsonFiles {
     }
 
     fn commit(&mut self) -> Result<()> {
-        self.streams.finish()?;
-        self.events.finish()?;
+        self.streams.finish_file()?;
+        self.events.finish_file()?;
         Ok(())
     }
 }
