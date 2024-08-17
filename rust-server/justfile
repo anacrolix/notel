@@ -1,2 +1,14 @@
 submit-sample:
-	curl http://localhost:4318 -v --data-binary @sample.json
+    curl http://localhost:4318 -v --data-binary @sample.json
+
+json-files-dir := "json_files"
+
+sqlite-to-json-files:
+    mkdir -p {{ json-files-dir }}
+    sqlite3 telemetry.db "select json_object('stream_id', stream_id, 'start_datetime', start_datetime, 'headers', headers) from streams" | zstd > {{ json-files-dir / "streams.sqlite.json.zst" }}
+    sqlite3 telemetry.db < sql/sqlite-events-to-json-files | zstd > {{ json-files-dir / "events.sqlite.json.zst" }}
+
+duckdb-tables-from-json-files:
+    -rm duckdb-json-files-tables
+    duckdb duckdb-json-files-tables < sql/duckdb-json-files-tables.sql
+    duckdb duckdb-json-files-tables < sql/json-files-to-duckdb-tables.sql

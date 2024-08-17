@@ -1,0 +1,6 @@
+select json_object(
+    'insert_datetime', insert_datetime,
+    'payload', payload,
+    'stream_id', stream_id,
+    'stream_event_index', rowid - min(rowid) over (partition by stream_id))
+from events

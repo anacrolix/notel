@@ -1,1 +1,4 @@
 /target
+/json_files
+/telemetry.db
+/telemetry.db-*

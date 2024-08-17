@@ -8,11 +8,11 @@ use axum::extract::WebSocketUpgrade;
 use axum::http::{HeaderMap, StatusCode};
 use chrono::SecondsFormat;
 use clap::Parser;
-use futures::select_biased;
 use futures::FutureExt;
+use futures::{future, select_biased, TryFutureExt};
 use futures::{Stream, StreamExt};
 use std::fmt::{Debug, Display, Formatter};
-use std::future::poll_fn;
+use std::future::{poll_fn, IntoFuture};
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
@@ -21,6 +21,7 @@ use tracing::*;
 #[derive(clap::Parser)]
 struct Args {
     #[arg(long)]
+    #[clap(value_enum, default_value_t=Storage::JsonFiles)]
     storage: Storage,
 }
 
@@ -28,6 +29,7 @@ struct Args {
 enum Storage {
     Sqlite,
     DuckDB,
+    JsonFiles,
 }
 
 #[tokio::main]
@@ -51,6 +53,8 @@ async fn main() -> Result<()> {
     let server = Arc::new(Server {
         db_conn: Mutex::new(<dyn Connection>::open(args.storage)?),
     });
+    // TODO: Catch a signal or handle an endpoint that triggers the db conn to be committed. Also do
+    // this on a timer.
     let tower_layer = tower_http::trace::TraceLayer::new_for_http()
         .make_span_with(tower_http::trace::DefaultMakeSpan::new().include_headers(true))
         .on_request(())
@@ -80,12 +84,25 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind("[::]:4318").await?;
     let listener_local_addr = listener.local_addr()?;
     info!(?listener_local_addr, "serving http");
-    Ok(axum::serve(listener, app).await?)
+    let http_server = axum::serve(listener, app)
+        .into_future()
+        .map_err(anyhow::Error::from);
+    let ctrl_c = async {
+        // TODO: Catch SIGTERM too?
+        tokio::signal::ctrl_c().await?;
+        info!("ctrl_c");
+        Ok(())
+    };
+    tokio::pin!(ctrl_c);
+    let either = future::select(http_server, ctrl_c).await;
+    either.factor_first().0
 }
 
 type SerializedHeaders = serde_json::Value;
 
-type StreamId = i64;
+// Let's see if u32 is enough. I might have to create a newtype here so I can get nicer hex
+// formatting and stuff.
+type StreamId = u32;
 
 type StreamEventIndex = u64;
 
@@ -188,7 +205,7 @@ impl Server {
     fn handle_message(
         &self,
         message: Message,
-        stream_id: i64,
+        stream_id: StreamId,
         stream_event_index: &mut StreamEventIndex,
     ) -> Result<StreamRetry> {
         match message {
@@ -220,17 +237,26 @@ impl Server {
             .new_stream(headers)
             .context("creating new stream")
             .map_err(Handle)?;
-        info!(stream_id, "started new stream");
+        // TODO: Flush streams
+        info!(%stream_id, "started new stream");
         let mut total_events = 0;
         let mut stream_event_index = 0;
         let result = loop {
             let (batch_count, last_recv_result) =
                 Self::receive_consecutive_websocket_messages(&mut websocket, |message| {
+                    // TODO: Take db_conn lock on first event.
                     self.handle_message(message, stream_id, &mut stream_event_index)
                 })
                 .await;
-            info!(batch_count, stream_id, "inserted consecutive payloads");
+            info!(batch_count, %stream_id, "inserted consecutive payloads");
             if batch_count != 0 {
+                // Just flush the events.
+                self.db_conn
+                    .lock()
+                    .unwrap()
+                    .flush()
+                    .context("flushing consecutive payloads")
+                    .map_err(Handle)?;
                 total_events += batch_count;
                 if let Err(err) = Self::acknowledge_inserted(&mut websocket, total_events).await {
                     // Report the acknowledgment error, which is pretty important, and return with
@@ -254,7 +280,7 @@ impl Server {
                 info!(stream_id, total_events, "stream ended");
             }
             Err(err) => {
-                info!(stream_id, total_events, %err, "stream ended");
+                info!(%stream_id, total_events, %err, "stream ended");
             }
         }
         result
@@ -317,9 +343,9 @@ impl Server {
         (status_code, format!("{}", payloads_inserted))
     }
 
-    fn new_stream(&self, headers: &HeaderMap) -> anyhow::Result<i64> {
+    fn new_stream(&self, headers: &HeaderMap) -> anyhow::Result<StreamId> {
         let headers_value = headers_to_json_value(headers)?;
-        let conn = self.db_conn.lock().unwrap();
+        let mut conn = self.db_conn.lock().unwrap();
         conn.new_stream(headers_value)
     }
 
@@ -328,11 +354,11 @@ impl Server {
         payload: &str,
         stream_id: StreamId,
         stream_event_index: StreamEventIndex,
-    ) -> anyhow::Result<()> {
+    ) -> Result<()> {
         // Down the track this could be done in a separate thread, or under a
         // transaction each time we read a chunk.
         debug!(payload, "inserting payload into store");
-        let conn = self.db_conn.lock().unwrap();
+        let mut conn = self.db_conn.lock().unwrap();
         conn.insert_event(stream_id, stream_event_index, payload)
             .context("inserting payload into store")
     }

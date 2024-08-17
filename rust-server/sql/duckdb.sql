@@ -2,8 +2,8 @@ create sequence seq_stream_id;
 
 CREATE TABLE streams(
     stream_id integer primary key default nextval('seq_stream_id'),
-    headers blob,
-    start_datetime text not null default current_timestamp
+    headers text not null,
+    start_timestamp timestamp not null default current_timestamp
 );
 
 CREATE TABLE events(

@@ -1,13 +1,25 @@
 use super::*;
+use chrono::Utc;
+use rand::random;
+use serde_json::json;
+use tempfile::NamedTempFile;
 
 pub(crate) trait Connection {
-    fn new_stream(&self, headers: SerializedHeaders) -> anyhow::Result<StreamId>;
+    fn new_stream(&mut self, headers: SerializedHeaders) -> Result<StreamId>;
     fn insert_event(
-        &self,
+        &mut self,
         stream_id: StreamId,
         stream_event_index: StreamEventIndex,
         payload: &str,
     ) -> Result<()>;
+    // Write stuff to disk
+    fn flush(&mut self) -> Result<()> {
+        Ok(())
+    }
+    // Make data available to observers.
+    fn commit(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 impl dyn Connection {
@@ -23,7 +35,7 @@ impl dyn Connection {
                 let user_version: u64 =
                     tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
                 if user_version == 0 {
-                    tx.execute_batch(include_str!("../schemas/sqlite.sql"))?;
+                    tx.execute_batch(include_str!("../sql/sqlite.sql"))?;
                     tx.pragma_update(None, "user_version", 1)?;
                 }
                 tx.commit()?;
@@ -32,18 +44,75 @@ impl dyn Connection {
             Storage::DuckDB => Box::new({
                 let mut conn = duckdb::Connection::open("duck.db")?;
                 let tx = conn.transaction()?;
-                if let Err(err) = tx.execute_batch(include_str!("../schemas/duckdb.sql")) {
+                if let Err(err) = tx.execute_batch(include_str!("../sql/duckdb.sql")) {
                     warn!(%err, "initing duckdb schema (haven't figured out user_version yet)");
                 }
                 tx.commit()?;
                 conn
             }),
+            Storage::JsonFiles => Box::new({
+                let streams =
+                    JsonFileWriter::new("streams".to_owned()).context("opening streams")?;
+                let events = JsonFileWriter::new("events".to_owned()).context("opening events")?;
+                JsonFiles { streams, events }
+            }),
         })
     }
 }
 
+struct JsonFileWriter {
+    w: Option<zstd::Encoder<'static, NamedTempFile>>,
+    table: String,
+}
+
+impl JsonFileWriter {
+    fn new(table: String) -> Result<Self> {
+        Ok(Self { w: None, table })
+    }
+    fn flush(&mut self) -> Result<()> {
+        let Some(mut w) = self.w.take() else {
+            return Ok(());
+        };
+        w.flush()?;
+        Ok(())
+    }
+    fn finish(&mut self) -> Result<()> {
+        let Some(w) = self.w.take() else {
+            return Ok(());
+        };
+        w.finish()?;
+        Ok(())
+    }
+    fn open(&mut self) -> Result<()> {
+        self.finish()?;
+        let dir_path = "json_files";
+        std::fs::create_dir_all(dir_path)?;
+        let temp_file = tempfile::Builder::new()
+            .prefix(&format!("{}.file.", self.table))
+            .append(true)
+            .suffix(".json.zst")
+            .keep(true)
+            .tempfile_in(dir_path)
+            .context("opening temp file")?;
+        self.w = Some(zstd::Encoder::new(temp_file, 0)?);
+        Ok(())
+    }
+    fn write(&mut self) -> Result<impl Write + '_> {
+        if self.w.is_none() {
+            self.open()?;
+        }
+        Ok(self.w.as_mut().unwrap())
+    }
+}
+
+impl Drop for JsonFileWriter {
+    fn drop(&mut self) {
+        self.finish().unwrap();
+    }
+}
+
 impl Connection for rusqlite::Connection {
-    fn new_stream(&self, headers_value: SerializedHeaders) -> anyhow::Result<StreamId> {
+    fn new_stream(&mut self, headers_value: SerializedHeaders) -> Result<StreamId> {
         Ok(self.query_row(
             "insert into streams (headers, start_datetime) values (jsonb(?), datetime('now')) returning stream_id",
             rusqlite::params![headers_value],
@@ -51,7 +120,7 @@ impl Connection for rusqlite::Connection {
         )?)
     }
     fn insert_event(
-        &self,
+        &mut self,
         stream_id: StreamId,
         _stream_event_index: StreamEventIndex,
         payload: &str,
@@ -67,7 +136,7 @@ impl Connection for rusqlite::Connection {
 }
 
 impl Connection for duckdb::Connection {
-    fn new_stream(&self, headers_value: SerializedHeaders) -> anyhow::Result<StreamId> {
+    fn new_stream(&mut self, headers_value: SerializedHeaders) -> Result<StreamId> {
         Ok(self.query_row(
             "insert into streams (headers) values (?) returning stream_id",
             duckdb::params![headers_value],
@@ -75,17 +144,67 @@ impl Connection for duckdb::Connection {
         )?)
     }
     fn insert_event(
-        &self,
+        &mut self,
         stream_id: StreamId,
         stream_event_index: StreamEventIndex,
         payload: &str,
-    ) -> anyhow::Result<()> {
+    ) -> Result<()> {
         self.execute(
             "\
             insert into events (stream_event_index, payload, stream_id) \
             values (?, ?, ?)",
             duckdb::params![stream_event_index, payload, stream_id],
         )?;
+        Ok(())
+    }
+}
+
+struct JsonFiles {
+    streams: JsonFileWriter,
+    events: JsonFileWriter,
+}
+
+impl Connection for JsonFiles {
+    fn new_stream(&mut self, headers: SerializedHeaders) -> Result<StreamId> {
+        let stream_id: StreamId = random();
+        let start_datetime = Utc::now().to_rfc3339();
+        let json_value = json!({
+            "stream_id": stream_id,
+            "start_datetime": start_datetime,
+            "headers": headers,
+        });
+        let mut writer = self.streams.write()?;
+        serde_json::to_writer(&mut writer, &json_value)?;
+        writer.write_all(b"\n")?;
+        Ok(stream_id)
+    }
+
+    fn insert_event(
+        &mut self,
+        stream_id: StreamId,
+        stream_event_index: StreamEventIndex,
+        payload: &str,
+    ) -> Result<()> {
+        let line_json = json!({
+            "stream_id": stream_id,
+            "stream_event_index": stream_event_index,
+            "payload": payload,
+        });
+        let mut writer = self.events.write()?;
+        serde_json::to_writer(&mut writer, &line_json)?;
+        writer.write_all(b"\n")?;
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.streams.flush()?;
+        self.events.flush()?;
+        Ok(())
+    }
+
+    fn commit(&mut self) -> Result<()> {
+        self.streams.finish()?;
+        self.events.finish()?;
         Ok(())
     }
 }
