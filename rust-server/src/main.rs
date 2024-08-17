@@ -12,10 +12,13 @@ use futures::FutureExt;
 use futures::{future, select_biased, TryFutureExt};
 use futures::{Stream, StreamExt};
 use std::fmt::{Debug, Display, Formatter};
-use std::future::{poll_fn, IntoFuture};
+use std::future::{poll_fn, Future, IntoFuture};
 use std::io::Write;
+use std::pin::pin;
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
+use tokio::signal::ctrl_c;
+use tokio::signal::unix::SignalKind;
 use tracing::*;
 
 #[derive(clap::Parser)]
@@ -50,9 +53,17 @@ async fn main() -> Result<()> {
         .init();
     debug!(test_arg = "hi mum", "debug level test");
     let args = Args::parse();
-    let server = Arc::new(Server {
-        db_conn: Mutex::new(<dyn Connection>::open(args.storage)?),
+    let db_conn = Arc::new(Mutex::new(<dyn Connection>::open(args.storage)?));
+    tokio::spawn({
+        let db_conn = db_conn.clone();
+        async move {
+            loop {
+                ctrl_c().await.unwrap();
+                log_commit(&mut **db_conn.lock().unwrap()).unwrap();
+            }
+        }
     });
+    let server = Arc::new(Server { db_conn });
     // TODO: Catch a signal or handle an endpoint that triggers the db conn to be committed. Also do
     // this on a timer.
     let tower_layer = tower_http::trace::TraceLayer::new_for_http()
@@ -87,15 +98,37 @@ async fn main() -> Result<()> {
     let http_server = axum::serve(listener, app)
         .into_future()
         .map_err(anyhow::Error::from);
-    let ctrl_c = async {
-        // TODO: Catch SIGTERM too?
-        tokio::signal::ctrl_c().await?;
-        info!("ctrl_c");
-        Ok(())
-    };
-    tokio::pin!(ctrl_c);
-    let either = future::select(http_server, ctrl_c).await;
+    let term_sigs = pin!(handle_main_signals()?);
+    let either = future::select(http_server, term_sigs).await;
     either.factor_first().0
+}
+
+fn handle_main_signals() -> Result<impl Future<Output = Result<()>>> {
+    // On Windows we probably wouldn't have this one. Also what about the fact this is normally for
+    // user detected errors?
+    let quit = signal("SIGQUIT", SignalKind::quit())?;
+    let term = signal("SIGTERM", SignalKind::terminate())?;
+    Ok(async move {
+        tokio::pin!(quit);
+        tokio::pin!(term);
+        let signal_name = future::select(quit, term).await.factor_first().0 .0;
+        warn!(signal_name, "received terminating main signal");
+        Ok(())
+    })
+}
+
+fn signal(name: &str, kind: SignalKind) -> Result<impl Future<Output = (&str, Option<()>)>> {
+    let mut signal = tokio::signal::unix::signal(kind)?;
+    Ok(async move { signal.recv().map(|maybe_sig| (name, maybe_sig)).await })
+}
+
+fn log_commit(conn: &mut (impl Connection + ?Sized)) -> Result<()> {
+    let res = conn.commit();
+    match &res {
+        Ok(()) => info!("committed"),
+        Err(err) => error!(%err, "committing"),
+    };
+    res
 }
 
 type SerializedHeaders = serde_json::Value;
@@ -107,7 +140,7 @@ type StreamId = u32;
 type StreamEventIndex = u64;
 
 struct Server {
-    db_conn: Mutex<Box<dyn Connection + Send>>,
+    db_conn: Arc<Mutex<Box<dyn Connection + Send>>>,
 }
 
 async fn iter_json_stream(
