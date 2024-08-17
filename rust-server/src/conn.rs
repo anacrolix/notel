@@ -114,7 +114,11 @@ impl Drop for JsonFileWriter {
 impl Connection for rusqlite::Connection {
     fn new_stream(&mut self, headers_value: SerializedHeaders) -> Result<StreamId> {
         Ok(self.query_row(
-            "insert into streams (headers, start_datetime) values (jsonb(?), datetime('now')) returning stream_id",
+            "\
+            insert into streams\
+                (headers, start_datetime)\
+                values (jsonb(?), datetime('now'))\
+                returning stream_id",
             rusqlite::params![headers_value],
             |row| row.get(0),
         )?)
@@ -206,5 +210,11 @@ impl Connection for JsonFiles {
         self.streams.finish()?;
         self.events.finish()?;
         Ok(())
+    }
+}
+
+impl Drop for JsonFiles {
+    fn drop(&mut self) {
+        log_commit(self).unwrap()
     }
 }
