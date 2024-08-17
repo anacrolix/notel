@@ -12,3 +12,13 @@ duckdb-tables-from-json-files:
     -rm duckdb-json-files-tables
     duckdb duckdb-json-files-tables < sql/duckdb-json-files-tables.sql
     duckdb duckdb-json-files-tables < sql/json-files-to-duckdb-tables.sql
+
+merge-json-files: (merge-json-files-table "events") (merge-json-files-table "streams")
+
+merge-json-files-table table:
+    #!/usr/bin/env bash
+    set -eu
+    declare -a old=(json_files/{{table}}.file.*.json.zst)
+    new="$(mktemp json_files/{{table}}.merged.json.zst.XXXXXX)"
+    lines=$(zstd -dcf "${old[@]}" | tee >(zstd > $new) | wc -l)
+    echo merged $lines lines from ${#old} files into $new
