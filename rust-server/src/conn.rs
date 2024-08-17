@@ -70,17 +70,17 @@ impl JsonFileWriter {
         Ok(Self { w: None, table })
     }
     fn flush(&mut self) -> Result<()> {
-        let Some(mut w) = self.w.take() else {
+        let Some(w) = &mut self.w else {
             return Ok(());
         };
-        w.flush()?;
-        Ok(())
+        // Finishes the zstd stream but not the file, making it data available to observers.
+        Ok(w.flush()?)
     }
     fn finish(&mut self) -> Result<()> {
         let Some(w) = self.w.take() else {
             return Ok(());
         };
-        w.finish()?;
+        w.finish()?.flush()?;
         Ok(())
     }
     fn open(&mut self) -> Result<()> {
