@@ -445,3 +445,9 @@ fn headers_to_json_value(headers: &HeaderMap) -> serde_json::Result<serde_json::
 fn sqlite_local_datetime_now_string() -> String {
     chrono::Local::now().to_rfc3339_opts(SecondsFormat::Millis, false)
 }
+
+enum Payload {
+    Binary,
+    Text,
+    Json,
+}

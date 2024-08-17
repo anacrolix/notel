@@ -10,6 +10,7 @@ pub(crate) trait Connection {
         &mut self,
         stream_id: StreamId,
         stream_event_index: StreamEventIndex,
+        // TODO: Could use payload type here to let implementation decide what to do.
         payload: &str,
     ) -> Result<()>;
     // Write stuff to disk
@@ -199,11 +200,12 @@ impl Connection for JsonFiles {
         stream_event_index: StreamEventIndex,
         payload: &str,
     ) -> Result<()> {
+        let payload_value: serde_json::Value = serde_json::from_str(payload)?;
         let line_json = json!({
             "insert_datetime": json_datetime_now(),
             "stream_id": stream_id,
             "stream_event_index": stream_event_index,
-            "payload": payload,
+            "payload": payload_value,
         });
         let mut writer = self.events.write()?;
         serde_json::to_writer(&mut writer, &line_json)?;
