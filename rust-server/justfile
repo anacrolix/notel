@@ -21,7 +21,10 @@ merge-json-files-table table:
     declare -a old=(json_files/{{table}}.file.*.json.zst)
     new="$(mktemp json_files/{{table}}.merged.json.zst.XXXXXX)"
     lines=$(zstd -dcf "${old[@]}" | tee >(zstd > $new) | wc -l)
-    echo merged $lines lines from ${#old} files into $new
+    echo merged $lines lines from ${#old[@]} files into $new
+    du -hs "${old[@]}"
+    du -hs "$new"
+    # trash -v "${old[@]}"
 
 count-file-lines:
     echo -n events && just count-file-lines-table events
