@@ -13,7 +13,11 @@ func ContextWithSlogger(ctx context.Context, l *slog.Logger) context.Context {
 }
 
 func SloggerFromContext(ctx context.Context) *slog.Logger {
-	return ctx.Value(sloggerKey{}).(*slog.Logger)
+	i := ctx.Value(sloggerKey{})
+	if i == nil {
+		return nil
+	}
+	return i.(*slog.Logger)
 }
 
 func MustSloggerFromContext(ctx context.Context) *slog.Logger {
