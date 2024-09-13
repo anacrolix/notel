@@ -181,10 +181,10 @@ fn json_datetime_now() -> serde_json::Value {
 
 impl Connection for JsonFiles {
     fn new_stream(&mut self, headers: SerializedHeaders) -> Result<StreamId> {
-        let stream_id: StreamId = random();
+        let stream_id: StreamId = StreamId(random());
         let start_datetime = Utc::now().to_rfc3339();
         let json_value = json!({
-            "stream_id": stream_id,
+            "stream_id": stream_id.0,
             "start_datetime": start_datetime,
             "headers": headers,
         });
@@ -203,7 +203,7 @@ impl Connection for JsonFiles {
         let payload_value: serde_json::Value = serde_json::from_str(payload)?;
         let line_json = json!({
             "insert_datetime": json_datetime_now(),
-            "stream_id": stream_id,
+            "stream_id": stream_id.0,
             "stream_event_index": stream_event_index,
             "payload": payload_value,
         });

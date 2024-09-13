@@ -1,4 +1,3 @@
-
 use crate::{headers_to_json_value, iter_json_stream};
 use axum::http::HeaderMap;
 use serde_json::json;
@@ -68,8 +67,8 @@ async fn test_chunked_json_stream() -> anyhow::Result<()> {
             Ok(())
         },
     )
-        .await
-        .unwrap();
+    .await
+    .unwrap();
     let output_strings = outputs
         .into_iter()
         .map(|bytes| std::str::from_utf8(&bytes).unwrap().to_string())
@@ -110,7 +109,7 @@ async fn test_chunked_json_stream_trailing_garbage() -> anyhow::Result<()> {
             Ok(())
         },
     )
-        .await;
+    .await;
     result
         .as_ref()
         .expect_err("should error on trailing json value");

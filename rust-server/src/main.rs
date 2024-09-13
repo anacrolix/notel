@@ -2,7 +2,10 @@
 mod tests;
 
 mod conn;
+mod stream_id;
+
 use conn::Connection;
+use stream_id::StreamId;
 
 use anyhow::{anyhow, Context, Result};
 use axum::body::Bytes;
@@ -78,7 +81,7 @@ async fn main() -> Result<()> {
             "/",
             axum::routing::post({
                 let server = Arc::clone(&server);
-                move |body| async move { server.submit(body).await }
+                move |body| async move { server.post_handler(body).await }
             }),
         )
         .route(
@@ -135,10 +138,6 @@ fn log_commit(conn: &mut (impl Connection + ?Sized)) -> Result<()> {
 }
 
 type SerializedHeaders = serde_json::Value;
-
-// Let's see if u32 is enough. I might have to create a newtype here so I can get nicer hex
-// formatting and stuff.
-type StreamId = u32;
 
 type StreamEventIndex = u64;
 
@@ -246,7 +245,7 @@ impl Server {
     ) -> Result<StreamRetry> {
         match message {
             Message::Close(reason) => {
-                debug!(stream_id, ?reason, "websocket closed");
+                debug!(%stream_id, ?reason, "websocket closed");
                 // Not sure if we should act on this or let the next recv return None?
                 Ok(StreamRetry::More)
             }
@@ -274,7 +273,6 @@ impl Server {
             .context("creating new stream")
             .map_err(Handle)?;
         // TODO: Flush streams
-        info!(%stream_id, "started new stream");
         let mut total_events = 0;
         let mut stream_event_index = 0;
         let result = loop {
@@ -313,7 +311,7 @@ impl Server {
         };
         match &result {
             Ok(()) => {
-                info!(stream_id, total_events, "stream ended");
+                info!(%stream_id, total_events, "stream ended");
             }
             Err(err) => {
                 info!(%stream_id, total_events, %err, "stream ended");
@@ -372,9 +370,14 @@ impl Server {
 
     // Eventually this might return a list of items added, or a count, so that callers can throw
     // away what they know was committed.
-    async fn submit(&self, req: axum::http::Request<axum::body::Body>) -> (StatusCode, String) {
+    async fn post_handler(
+        &self,
+        req: axum::http::Request<axum::body::Body>,
+    ) -> (StatusCode, String) {
         let mut payloads_inserted = 0;
-        let status_code = self.submit_inner(req, &mut payloads_inserted).await;
+        let status_code = self
+            .post_handler_status_code(req, &mut payloads_inserted)
+            .await;
         info!(payloads_inserted, "submit handled ok");
         (status_code, format!("{}", payloads_inserted))
     }
@@ -382,7 +385,9 @@ impl Server {
     fn new_stream(&self, headers: &HeaderMap) -> anyhow::Result<StreamId> {
         let headers_value = headers_to_json_value(headers)?;
         let mut conn = self.db_conn.lock().unwrap();
-        conn.new_stream(headers_value)
+        let stream_id = conn.new_stream(headers_value)?;
+        info!(%stream_id, "started new stream");
+        Ok(stream_id)
     }
 
     fn insert_event(
@@ -391,15 +396,15 @@ impl Server {
         stream_id: StreamId,
         stream_event_index: StreamEventIndex,
     ) -> Result<()> {
-        // Down the track this could be done in a separate thread, or under a
-        // transaction each time we read a chunk.
+        // Down the track this could be done in a separate thread, or under a transaction each time
+        // we read a chunk.
         debug!(payload, "inserting payload into store");
         let mut conn = self.db_conn.lock().unwrap();
         conn.insert_event(stream_id, stream_event_index, payload)
             .context("inserting payload into store")
     }
 
-    async fn submit_inner(
+    async fn post_handler_status_code(
         &self,
         req: axum::http::Request<axum::body::Body>,
         payloads_inserted: &mut u64,
