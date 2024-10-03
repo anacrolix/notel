@@ -1,12 +1,14 @@
 use super::*;
+use axum::async_trait;
 use chrono::Utc;
 use rand::random;
 use serde_json::json;
 use tempfile::NamedTempFile;
 
-pub(crate) trait Connection {
-    fn new_stream(&mut self, headers: SerializedHeaders) -> Result<StreamId>;
-    fn insert_event(
+#[async_trait]
+pub(crate) trait Connection: Send {
+    async fn new_stream(&mut self, headers: SerializedHeaders) -> Result<StreamId>;
+    async fn insert_event(
         &mut self,
         stream_id: StreamId,
         stream_event_index: StreamEventIndex,
@@ -14,11 +16,11 @@ pub(crate) trait Connection {
         payload: &str,
     ) -> Result<()>;
     // Write stuff to disk
-    fn flush(&mut self) -> Result<()> {
+    async fn flush(&mut self) -> Result<()> {
         Ok(())
     }
     // Make data available to observers.
-    fn commit(&mut self) -> Result<()> {
+    async fn commit(&mut self) -> Result<()> {
         Ok(())
     }
 }
@@ -67,6 +69,12 @@ struct JsonFileWriter {
 }
 
 impl JsonFileWriter {
+    fn take(&mut self) -> Self {
+        Self {
+            w: self.w.take(),
+            table: std::mem::take(&mut self.table),
+        }
+    }
     fn new(table: String) -> Result<Self> {
         Ok(Self { w: None, table })
     }
@@ -118,8 +126,9 @@ impl Drop for JsonFileWriter {
     }
 }
 
+#[async_trait]
 impl Connection for rusqlite::Connection {
-    fn new_stream(&mut self, headers_value: SerializedHeaders) -> Result<StreamId> {
+    async fn new_stream(&mut self, headers_value: SerializedHeaders) -> Result<StreamId> {
         Ok(self.query_row(
             "\
             insert into streams\
@@ -130,7 +139,7 @@ impl Connection for rusqlite::Connection {
             |row| row.get(0),
         )?)
     }
-    fn insert_event(
+    async fn insert_event(
         &mut self,
         stream_id: StreamId,
         _stream_event_index: StreamEventIndex,
@@ -146,15 +155,16 @@ impl Connection for rusqlite::Connection {
     }
 }
 
+#[async_trait]
 impl Connection for duckdb::Connection {
-    fn new_stream(&mut self, headers_value: SerializedHeaders) -> Result<StreamId> {
+    async fn new_stream(&mut self, headers_value: SerializedHeaders) -> Result<StreamId> {
         Ok(self.query_row(
             "insert into streams (headers) values (?) returning stream_id",
             duckdb::params![headers_value],
             |row| row.get(0),
         )?)
     }
-    fn insert_event(
+    async fn insert_event(
         &mut self,
         stream_id: StreamId,
         stream_event_index: StreamEventIndex,
@@ -175,12 +185,22 @@ struct JsonFiles {
     events: JsonFileWriter,
 }
 
+impl JsonFiles {
+    fn take(&mut self) -> Self {
+        Self {
+            streams: self.streams.take(),
+            events: self.events.take(),
+        }
+    }
+}
+
 fn json_datetime_now() -> serde_json::Value {
     json!(Utc::now().to_rfc3339())
 }
 
+#[async_trait]
 impl Connection for JsonFiles {
-    fn new_stream(&mut self, headers: SerializedHeaders) -> Result<StreamId> {
+    async fn new_stream(&mut self, headers: SerializedHeaders) -> Result<StreamId> {
         let stream_id: StreamId = StreamId(random());
         let start_datetime = Utc::now().to_rfc3339();
         let json_value = json!({
@@ -194,7 +214,7 @@ impl Connection for JsonFiles {
         Ok(stream_id)
     }
 
-    fn insert_event(
+    async fn insert_event(
         &mut self,
         stream_id: StreamId,
         stream_event_index: StreamEventIndex,
@@ -213,13 +233,13 @@ impl Connection for JsonFiles {
         Ok(())
     }
 
-    fn flush(&mut self) -> Result<()> {
+    async fn flush(&mut self) -> Result<()> {
         self.streams.flush()?;
         self.events.flush()?;
         Ok(())
     }
 
-    fn commit(&mut self) -> Result<()> {
+    async fn commit(&mut self) -> Result<()> {
         self.streams.finish_file()?;
         self.events.finish_file()?;
         Ok(())
@@ -228,6 +248,7 @@ impl Connection for JsonFiles {
 
 impl Drop for JsonFiles {
     fn drop(&mut self) {
-        log_commit(self).unwrap()
+        let mut conn = self.take();
+        tokio::spawn(async move { log_commit(&mut conn).await.unwrap() });
     }
 }

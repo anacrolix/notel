@@ -21,10 +21,11 @@ use std::fmt::{Debug, Display, Formatter};
 use std::future::{poll_fn, Future, IntoFuture};
 use std::io::Write;
 use std::pin::pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::task::Poll;
 use tokio::signal::ctrl_c;
 use tokio::signal::unix::SignalKind;
+use tokio::sync::Mutex;
 use tracing::*;
 
 #[derive(clap::Parser)]
@@ -65,7 +66,7 @@ async fn main() -> Result<()> {
         async move {
             loop {
                 ctrl_c().await.unwrap();
-                log_commit(&mut **db_conn.lock().unwrap()).unwrap();
+                log_commit(&mut **db_conn.lock().await).await.unwrap();
             }
         }
     });
@@ -128,8 +129,8 @@ fn signal(name: &str, kind: SignalKind) -> Result<impl Future<Output = (&str, Op
     Ok(async move { signal.recv().map(|maybe_sig| (name, maybe_sig)).await })
 }
 
-fn log_commit(conn: &mut (impl Connection + ?Sized)) -> Result<()> {
-    let res = conn.commit();
+async fn log_commit(conn: &mut (impl Connection + ?Sized)) -> Result<()> {
+    let res = conn.commit().await;
     match &res {
         Ok(()) => info!("committed"),
         Err(err) => error!(%err, "committing"),
@@ -145,10 +146,13 @@ struct Server {
     db_conn: Arc<Mutex<Box<dyn Connection + Send>>>,
 }
 
-async fn iter_json_stream(
+async fn iter_json_stream<F>(
     mut body_data_stream: impl Stream<Item = Result<Bytes, axum::Error>> + Unpin,
-    mut on_payload: impl FnMut(&[u8]) -> Result<()>,
-) -> Result<(), (anyhow::Error, StatusCode)> {
+    mut on_payload: impl FnMut(Vec<u8>) -> F,
+) -> Result<(), (anyhow::Error, StatusCode)>
+where
+    F: Future<Output = Result<()>>,
+{
     let mut bytes = vec![];
     let mut last_eof_error = None;
     while let Some(result) = body_data_stream.next().await {
@@ -182,8 +186,8 @@ async fn iter_json_stream(
                 Ok(serde::de::IgnoredAny) => {
                     last_eof_error = None;
                     let value_end_offset = json_stream_deserializer.byte_offset();
-                    let payload = &bytes[last_offset..value_end_offset];
-                    if let Err(err) = on_payload(payload) {
+                    let payload = bytes[last_offset..value_end_offset].to_vec();
+                    if let Err(err) = on_payload(payload).await {
                         return Err((
                             err.context("handling payload"),
                             StatusCode::INTERNAL_SERVER_ERROR,
@@ -237,7 +241,7 @@ impl Server {
         }
     }
 
-    fn handle_message(
+    async fn handle_message(
         &self,
         message: Message,
         stream_id: StreamId,
@@ -256,6 +260,7 @@ impl Server {
             _ => {
                 let payload = message.to_text().context("converting payload to text")?;
                 self.insert_event(payload, stream_id, *stream_event_index)
+                    .await
                     .context("inserting event")?;
                 Ok(StreamRetry::More)
             }
@@ -270,25 +275,30 @@ impl Server {
     ) -> Result<(), Error> {
         let stream_id = self
             .new_stream(headers)
+            .await
             .context("creating new stream")
             .map_err(Handle)?;
         // TODO: Flush streams
         let mut total_events = 0;
         let mut stream_event_index = 0;
         let result = loop {
-            let (batch_count, last_recv_result) =
-                Self::receive_consecutive_websocket_messages(&mut websocket, |message| {
+            let (batch_count, last_recv_result) = Self::receive_consecutive_websocket_messages(
+                &mut websocket,
+                |message| async move {
                     // TODO: Take db_conn lock on first event.
                     self.handle_message(message, stream_id, &mut stream_event_index)
-                })
-                .await;
+                        .await
+                },
+            )
+            .await;
             info!(batch_count, %stream_id, "inserted consecutive payloads");
             if batch_count != 0 {
                 // Just flush the events.
                 self.db_conn
                     .lock()
-                    .unwrap()
+                    .await
                     .flush()
+                    .await
                     .context("flushing consecutive payloads")
                     .map_err(Handle)?;
                 total_events += batch_count;
@@ -320,10 +330,13 @@ impl Server {
         result
     }
 
-    async fn receive_consecutive_websocket_messages(
+    async fn receive_consecutive_websocket_messages<F>(
         websocket: &mut WebSocket,
-        mut handle: impl FnMut(Message) -> Result<StreamRetry>,
-    ) -> (u64, Result<StreamRetry, Error>) {
+        mut handle: impl FnMut(Message) -> F,
+    ) -> (u64, Result<StreamRetry, Error>)
+    where
+        F: Future<Output = Result<StreamRetry>>,
+    {
         let mut count = 0;
         let result = loop {
             let mut nonblocking = poll_fn(|_cx| {
@@ -342,7 +355,7 @@ impl Server {
                 }
             };
             match match option_recv {
-                Some(Ok(message)) => match handle(message) {
+                Some(Ok(message)) => match handle(message).await {
                     Ok(more) => {
                         count += 1;
                         more
@@ -382,15 +395,15 @@ impl Server {
         (status_code, format!("{}", payloads_inserted))
     }
 
-    fn new_stream(&self, headers: &HeaderMap) -> anyhow::Result<StreamId> {
+    async fn new_stream(&self, headers: &HeaderMap) -> anyhow::Result<StreamId> {
         let headers_value = headers_to_json_value(headers)?;
-        let mut conn = self.db_conn.lock().unwrap();
-        let stream_id = conn.new_stream(headers_value)?;
+        let mut conn = self.db_conn.lock().await;
+        let stream_id = conn.new_stream(headers_value).await?;
         info!(%stream_id, "started new stream");
         Ok(stream_id)
     }
 
-    fn insert_event(
+    async fn insert_event(
         &self,
         payload: &str,
         stream_id: StreamId,
@@ -399,8 +412,9 @@ impl Server {
         // Down the track this could be done in a separate thread, or under a transaction each time
         // we read a chunk.
         debug!(payload, "inserting payload into store");
-        let mut conn = self.db_conn.lock().unwrap();
+        let mut conn = self.db_conn.lock().await;
         conn.insert_event(stream_id, stream_event_index, payload)
+            .await
             .context("inserting payload into store")
     }
 
@@ -409,7 +423,7 @@ impl Server {
         req: axum::http::Request<axum::body::Body>,
         payloads_inserted: &mut u64,
     ) -> StatusCode {
-        let stream_id = match self.new_stream(req.headers()) {
+        let stream_id = match self.new_stream(req.headers()).await {
             Err(err) => {
                 error!(?err, "creating new stream");
                 return StatusCode::INTERNAL_SERVER_ERROR;
@@ -419,13 +433,16 @@ impl Server {
         let body_data_stream = req.into_body().into_data_stream();
         let mut stream_event_index = 0;
         let result = iter_json_stream(body_data_stream, move |payload| {
-            // sqlite needs to be given text.
-            let payload = std::str::from_utf8(payload).unwrap();
-            self.insert_event(payload, stream_id, stream_event_index)?;
             *payloads_inserted += 1;
             stream_event_index += 1;
             assert_eq!(stream_event_index, *payloads_inserted);
-            Ok(())
+            async move {
+                // sqlite needs to be given text.
+                let payload = std::str::from_utf8(&payload).unwrap();
+                self.insert_event(payload, stream_id, stream_event_index)
+                    .await?;
+                Ok(())
+            }
         })
         .await;
         match result {

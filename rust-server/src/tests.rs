@@ -64,7 +64,7 @@ async fn test_chunked_json_stream() -> anyhow::Result<()> {
         futures::stream::iter(inputs.map(|str| Ok(str.into()))),
         |payload| {
             outputs.push(payload.to_owned());
-            Ok(())
+            async move { Ok(()) }
         },
     )
     .await
@@ -106,7 +106,7 @@ async fn test_chunked_json_stream_trailing_garbage() -> anyhow::Result<()> {
         futures::stream::iter(inputs.map(|str| Ok(str.into()))),
         |payload| {
             outputs.push(payload.to_owned());
-            Ok(())
+            async { Ok(()) }
         },
     )
     .await;
