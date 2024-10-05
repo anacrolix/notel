@@ -63,6 +63,7 @@ enum Storage {
     Sqlite,
     DuckDB,
     JsonFiles,
+    Postgres,
 }
 
 #[tokio::main]
@@ -501,8 +502,8 @@ fn sqlite_local_datetime_now_string() -> String {
     chrono::Local::now().to_rfc3339_opts(SecondsFormat::Millis, false)
 }
 
-enum Payload {
-    Binary,
-    Text,
-    Json,
-}
+// enum Payload {
+//     Binary,
+//     Text,
+//     Json,
+// }
