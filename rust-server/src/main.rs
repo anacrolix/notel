@@ -33,6 +33,30 @@ struct Args {
     #[arg(long)]
     #[clap(value_enum, default_value_t=Storage::JsonFiles)]
     storage: Storage,
+
+    /// Path to the directory where the database file(s) will be created
+    #[arg(long)]
+    #[clap(required_if_eq("storage", "Sqlite"))]
+    #[clap(required_if_eq("storage", "DuckDB"))]
+    #[clap(required_if_eq("storage", "JsonFiles"))]
+    db_dir_path: Option<String>,
+
+    /// Schema file path
+    #[arg(long)]
+    #[clap(required_if_eq("storage", "Sqlite"))]
+    #[clap(required_if_eq("storage", "DuckDB"))]
+    #[clap(required_if_eq("storage", "Postgres"))]
+    schema_path: Option<String>,
+
+    /// Connection string for the database
+    #[arg(long)]
+    #[clap(required_if_eq("storage", "Postgres"))]
+    conn_str: Option<String>,
+
+    /// Path to the TLS certificate file
+    #[arg(long)]
+    #[clap(required_if_eq("storage", "Postgres"))]
+    tls_cert_path: Option<String>,
 }
 
 #[derive(Clone, clap::ValueEnum)]
@@ -60,7 +84,6 @@ async fn main() -> Result<()> {
         .init();
     debug!(test_arg = "hi mum", "debug level test");
     let args = Args::parse();
-    let db_conn = Arc::new(Mutex::new(<dyn Connection>::open(args.storage)?));
     tokio::spawn({
         let db_conn = db_conn.clone();
         async move {
@@ -70,6 +93,16 @@ async fn main() -> Result<()> {
             }
         }
     });
+    let db_conn = Arc::new(Mutex::new(
+        <dyn Connection>::open(
+            args.storage,
+            args.schema_path,
+            args.conn_str,
+            args.db_dir_path,
+            args.tls_cert_path,
+        )
+        .await?,
+    ));
     let server = Arc::new(Server { db_conn });
     // TODO: Catch a signal or handle an endpoint that triggers the db conn to be committed. Also do
     // this on a timer.

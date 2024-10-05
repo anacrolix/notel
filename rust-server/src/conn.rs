@@ -26,10 +26,18 @@ pub(crate) trait Connection: Send {
 }
 
 impl dyn Connection {
-    pub(crate) fn open(storage: Storage) -> Result<Box<dyn Connection + Send>> {
+    pub(crate) async fn open(
+        storage: Storage,
+        schema_path: Option<String>,
+        conn_str: Option<String>,
+        db_dir_path: Option<String>,
+        tls_cert_path: Option<String>,
+    ) -> Result<Box<dyn Connection + Send>> {
         Ok(match storage {
             Storage::Sqlite => Box::new({
-                let mut conn = rusqlite::Connection::open("telemetry.db")?;
+                let db_path = db_dir_path.unwrap() + "/telemetry.sqlite.db";
+                let schema_contents = fs::read_to_string(schema_path.unwrap())?;
+                let mut conn = rusqlite::Connection::open(db_path)?;
                 conn.pragma_update(None, "foreign_keys", "on")?;
                 if !conn.pragma_query_value(None, "foreign_keys", |row| row.get(0))? {
                     warn!("foreign keys not enabled");
@@ -38,16 +46,18 @@ impl dyn Connection {
                 let user_version: u64 =
                     tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
                 if user_version == 0 {
-                    tx.execute_batch(include_str!("../sql/sqlite.sql"))?;
+                    tx.execute_batch(&schema_contents)?;
                     tx.pragma_update(None, "user_version", 1)?;
                 }
                 tx.commit()?;
                 conn
             }),
             Storage::DuckDB => Box::new({
-                let mut conn = duckdb::Connection::open("duck.db")?;
+                let db_path = db_dir_path.unwrap() + "/duck.db";
+                let schema_contents = fs::read_to_string(schema_path.unwrap())?;
+                let mut conn = duckdb::Connection::open(db_path)?;
                 let tx = conn.transaction()?;
-                if let Err(err) = tx.execute_batch(include_str!("../sql/duckdb.sql")) {
+                if let Err(err) = tx.execute_batch(&schema_contents) {
                     warn!(%err, "initing duckdb schema (haven't figured out user_version yet)");
                 }
                 tx.commit()?;
