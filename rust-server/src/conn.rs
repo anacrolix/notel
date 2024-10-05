@@ -259,6 +259,12 @@ impl Connection for JsonFiles {
 impl Drop for JsonFiles {
     fn drop(&mut self) {
         let mut conn = self.take();
-        tokio::spawn(async move { log_commit(&mut conn).await.unwrap() });
+        tokio::spawn(async move {
+            if let Err(err) = conn.commit().await {
+                error!(%err, "logging commit");
+            } else {
+                info!("committed");
+            }
+        });
     }
 }

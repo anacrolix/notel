@@ -23,7 +23,6 @@ use std::io::Write;
 use std::pin::pin;
 use std::sync::Arc;
 use std::task::Poll;
-use tokio::signal::ctrl_c;
 use tokio::signal::unix::SignalKind;
 use tokio::sync::Mutex;
 use tracing::*;
@@ -84,15 +83,6 @@ async fn main() -> Result<()> {
         .init();
     debug!(test_arg = "hi mum", "debug level test");
     let args = Args::parse();
-    tokio::spawn({
-        let db_conn = db_conn.clone();
-        async move {
-            loop {
-                ctrl_c().await.unwrap();
-                log_commit(&mut **db_conn.lock().await).await.unwrap();
-            }
-        }
-    });
     let db_conn = Arc::new(Mutex::new(
         <dyn Connection>::open(
             args.storage,
@@ -103,6 +93,18 @@ async fn main() -> Result<()> {
         )
         .await?,
     ));
+    let onexit = {
+        let db_conn = Arc::clone(&db_conn);
+        move || async move {
+            let mut db_conn = db_conn.lock().await;
+            if let Err(err) = db_conn.commit().await {
+                error!(%err, "logging commit");
+            } else {
+                info!("committed");
+            }
+        }
+    };
+
     let server = Arc::new(Server { db_conn });
     // TODO: Catch a signal or handle an endpoint that triggers the db conn to be committed. Also do
     // this on a timer.
@@ -138,21 +140,28 @@ async fn main() -> Result<()> {
     let http_server = axum::serve(listener, app)
         .into_future()
         .map_err(anyhow::Error::from);
-    let term_sigs = pin!(handle_main_signals()?);
+    let term_sigs = pin!(handle_main_signals(onexit)?);
     let either = future::select(http_server, term_sigs).await;
     either.factor_first().0
 }
 
-fn handle_main_signals() -> Result<impl Future<Output = Result<()>>> {
+fn handle_main_signals<F, Fut>(onexit: F) -> Result<impl Future<Output = Result<()>>>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = ()>,
+{
     // On Windows we probably wouldn't have this one. Also what about the fact this is normally for
     // user detected errors?
+    let interrupt = signal("SIGINT", SignalKind::interrupt())?;
     let quit = signal("SIGQUIT", SignalKind::quit())?;
     let term = signal("SIGTERM", SignalKind::terminate())?;
     Ok(async move {
         tokio::pin!(quit);
         tokio::pin!(term);
-        let signal_name = future::select(quit, term).await.factor_first().0 .0;
+        tokio::pin!(interrupt);
+        let signal_name = future::select_all(vec![quit, term, interrupt]).await.0 .0;
         warn!(signal_name, "received terminating main signal");
+        onexit().await;
         Ok(())
     })
 }
@@ -160,15 +169,6 @@ fn handle_main_signals() -> Result<impl Future<Output = Result<()>>> {
 fn signal(name: &str, kind: SignalKind) -> Result<impl Future<Output = (&str, Option<()>)>> {
     let mut signal = tokio::signal::unix::signal(kind)?;
     Ok(async move { signal.recv().map(|maybe_sig| (name, maybe_sig)).await })
-}
-
-async fn log_commit(conn: &mut (impl Connection + ?Sized)) -> Result<()> {
-    let res = conn.commit().await;
-    match &res {
-        Ok(()) => info!("committed"),
-        Err(err) => error!(%err, "committing"),
-    };
-    res
 }
 
 type SerializedHeaders = serde_json::Value;
