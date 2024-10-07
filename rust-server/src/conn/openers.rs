@@ -10,9 +10,21 @@ use tracing::{debug, error, warn};
 #[derive(Clone, clap::Args)]
 struct LocalStorageArgs {
     #[arg(long)]
-    schema_path: String,
+    schema_path: Option<String>,
+    // I'd rather have a default for duck DB and sqlite that are exposed here, but LocalStorageArgs
+    // is shared by them.
     #[arg(long)]
-    db_dir_path: PathBuf,
+    db_path: Option<PathBuf>,
+}
+
+impl LocalStorageArgs {
+    fn open_schema_path_or_embedded(&self, embedded: &str) -> Result<String> {
+        if let Some(schema_path) = &self.schema_path {
+            Ok(fs::read_to_string(schema_path)?)
+        } else {
+            Ok(embedded.to_owned())
+        }
+    }
 }
 
 #[derive(Clone, clap::Args)]
@@ -24,13 +36,15 @@ pub struct SqliteOpen {
 impl StorageOpen for SqliteOpen {
     type Conn = rusqlite::Connection;
 
-    async fn open(self) -> anyhow::Result<Self::Conn> {
-        let LocalStorageArgs {
-            db_dir_path,
-            schema_path,
-        } = self.args;
-        let db_path = db_dir_path.join("telemetry.sqlite.db");
-        let schema_contents = fs::read_to_string(schema_path)?;
+    async fn open(self) -> Result<Self::Conn> {
+        let db_path = self
+            .args
+            .db_path
+            .clone()
+            .unwrap_or_else(|| "telemetry.sqlite.db".to_owned().into());
+        let schema_contents = self
+            .args
+            .open_schema_path_or_embedded(include_str!("../../sql/sqlite.sql"))?;
         let mut conn = rusqlite::Connection::open(db_path)?;
         conn.pragma_update(None, "foreign_keys", "on")?;
         if !conn.pragma_query_value(None, "foreign_keys", |row| row.get(0))? {
@@ -56,13 +70,15 @@ pub struct DuckDbOpen {
 impl StorageOpen for DuckDbOpen {
     type Conn = duckdb::Connection;
 
-    async fn open(self) -> anyhow::Result<Self::Conn> {
-        let LocalStorageArgs {
-            db_dir_path,
-            schema_path,
-        } = self.args;
-        let db_path = db_dir_path.join("duck.db");
-        let schema_contents = fs::read_to_string(schema_path)?;
+    async fn open(self) -> Result<Self::Conn> {
+        let db_path = self
+            .args
+            .db_path
+            .clone()
+            .unwrap_or_else(|| "duck.db".into());
+        let schema_contents = self
+            .args
+            .open_schema_path_or_embedded(include_str!("../../sql/duckdb.sql"))?;
         let mut conn = duckdb::Connection::open(db_path)?;
         let tx = conn.transaction()?;
         if let Err(err) = tx.execute_batch(&schema_contents) {
@@ -75,7 +91,7 @@ impl StorageOpen for DuckDbOpen {
 
 pub trait StorageOpen {
     type Conn;
-    async fn open(self) -> anyhow::Result<Self::Conn>;
+    async fn open(self) -> Result<Self::Conn>;
 }
 
 #[derive(Clone, clap::Args)]
@@ -84,11 +100,9 @@ pub struct JsonFilesOpen {}
 impl StorageOpen for JsonFilesOpen {
     type Conn = JsonFiles;
 
-    async fn open(self) -> anyhow::Result<Self::Conn> {
-        let streams =
-            crate::conn::JsonFileWriter::new("streams".to_owned()).context("opening streams")?;
-        let events =
-            crate::conn::JsonFileWriter::new("events".to_owned()).context("opening events")?;
+    async fn open(self) -> Result<Self::Conn> {
+        let streams = JsonFileWriter::new("streams".to_owned()).context("opening streams")?;
+        let events = JsonFileWriter::new("events".to_owned()).context("opening events")?;
         Ok(JsonFiles { streams, events })
     }
 }
@@ -106,7 +120,7 @@ pub(crate) struct PostgresOpener {
 impl StorageOpen for PostgresOpener {
     type Conn = Postgres;
 
-    async fn open(self) -> anyhow::Result<Self::Conn> {
+    async fn open(self) -> Result<Self::Conn> {
         let PostgresOpener {
             tls_cert_path,
             conn_str,

@@ -27,6 +27,11 @@ pub(crate) trait Connection: Send {
     async fn commit(&mut self) -> Result<()> {
         Ok(())
     }
+    /// Whether sigint should be hooked to trigger a commit. Some storage types buffer output and
+    /// need to be committed to ensure observability of data up to the point of the commit.
+    fn commit_on_sigint(&self) -> bool {
+        false
+    }
 }
 
 pub struct Postgres {
@@ -73,16 +78,6 @@ impl Connection for Postgres {
                 ],
             )
             .await?;
-        Ok(())
-    }
-
-    async fn flush(&mut self) -> Result<()> {
-        // Not necessary for Postgres
-        Ok(())
-    }
-
-    async fn commit(&mut self) -> Result<()> {
-        // Not necessary for Postgres
         Ok(())
     }
 }
@@ -268,17 +263,15 @@ impl Connection for JsonFiles {
         self.events.finish_file()?;
         Ok(())
     }
+
+    fn commit_on_sigint(&self) -> bool {
+        true
+    }
 }
 
 impl Drop for JsonFiles {
     fn drop(&mut self) {
         let mut conn = self.take();
-        tokio::spawn(async move {
-            if let Err(err) = conn.commit().await {
-                error!(%err, "logging commit");
-            } else {
-                info!("committed");
-            }
-        });
+        tokio::spawn(async move { log_commit(&mut conn).await.unwrap() });
     }
 }

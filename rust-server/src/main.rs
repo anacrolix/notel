@@ -23,6 +23,7 @@ use std::io::Write;
 use std::pin::pin;
 use std::sync::Arc;
 use std::task::Poll;
+use tokio::signal::ctrl_c;
 use tokio::signal::unix::SignalKind;
 use tokio::sync::Mutex;
 use tracing::*;
@@ -81,18 +82,25 @@ async fn main() -> Result<()> {
         .init();
     debug!(test_arg = "hi mum", "debug level test");
     let args = Args::parse();
-    let db_conn = Arc::new(Mutex::new(args.storage.open().await?));
-    let onexit = {
-        let db_conn = Arc::clone(&db_conn);
-        move || async move {
-            let mut db_conn = db_conn.lock().await;
-            if let Err(err) = db_conn.commit().await {
-                error!(%err, "logging commit");
-            } else {
-                info!("committed");
+    let db_conn = args.storage.open().await?;
+    let commit_on_sigint = db_conn.commit_on_sigint();
+    let db_conn = Arc::new(Mutex::new(db_conn));
+
+    // This catches signals that trigger commit. Spin it up even if not committing on sigint to
+    // ensure all behaviours are handled correctly.
+    tokio::spawn({
+        let db_conn = db_conn.clone();
+        async move {
+            if !db_conn.lock().await.commit_on_sigint() {
+                std::future::pending::<()>().await;
+                return;
+            }
+            loop {
+                ctrl_c().await.unwrap();
+                log_commit(&mut **db_conn.lock().await).await.unwrap();
             }
         }
-    };
+    });
 
     let server = Arc::new(Server { db_conn });
     // TODO: Catch a signal or handle an endpoint that triggers the db conn to be committed. Also do
@@ -129,28 +137,27 @@ async fn main() -> Result<()> {
     let http_server = axum::serve(listener, app)
         .into_future()
         .map_err(anyhow::Error::from);
-    let term_sigs = pin!(handle_main_signals(onexit)?);
+    let term_sigs = pin!(handle_main_signals(commit_on_sigint)?);
     let either = future::select(http_server, term_sigs).await;
     either.factor_first().0
 }
 
-fn handle_main_signals<F, Fut>(onexit: F) -> Result<impl Future<Output = Result<()>>>
-where
-    F: FnOnce() -> Fut,
-    Fut: Future<Output = ()>,
-{
-    // On Windows we probably wouldn't have this one. Also what about the fact this is normally for
-    // user detected errors?
-    let interrupt = signal("SIGINT", SignalKind::interrupt())?;
-    let quit = signal("SIGQUIT", SignalKind::quit())?;
-    let term = signal("SIGTERM", SignalKind::terminate())?;
+fn handle_main_signals(commit_on_sigint: bool) -> Result<impl Future<Output = Result<()>>> {
+    let mut signals = vec![];
+    if !commit_on_sigint {
+        signals.push(Box::pin(signal("SIGINT", SignalKind::interrupt())?));
+    }
+    for (name, kind) in [
+        // On Windows we probably wouldn't have this one. Also what about the fact this is normally
+        // for user detected errors?
+        ("SIGQUIT", SignalKind::quit()),
+        ("SIGTERM", SignalKind::terminate()),
+    ] {
+        signals.push(Box::pin(signal(name, kind)?));
+    }
     Ok(async move {
-        tokio::pin!(quit);
-        tokio::pin!(term);
-        tokio::pin!(interrupt);
-        let signal_name = future::select_all(vec![quit, term, interrupt]).await.0 .0;
+        let signal_name = future::select_all(signals).await.0 .0;
         warn!(signal_name, "received terminating main signal");
-        onexit().await;
         Ok(())
     })
 }
@@ -158,6 +165,15 @@ where
 fn signal(name: &str, kind: SignalKind) -> Result<impl Future<Output = (&str, Option<()>)>> {
     let mut signal = tokio::signal::unix::signal(kind)?;
     Ok(async move { signal.recv().map(|maybe_sig| (name, maybe_sig)).await })
+}
+
+async fn log_commit(conn: &mut (impl Connection + ?Sized)) -> Result<()> {
+    let res = conn.commit().await;
+    match &res {
+        Ok(()) => info!("committed"),
+        Err(err) => error!(%err, "committing"),
+    };
+    res
 }
 
 type SerializedHeaders = serde_json::Value;
