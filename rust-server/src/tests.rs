@@ -9,11 +9,12 @@ use tokio_postgres::NoTls;
 async fn test_postgres_new_stream_and_event() -> anyhow::Result<()> {
     let _ = env_logger::try_init();
     let db = PgTempDB::async_new().await;
+    let connection_uri = db.connection_uri();
     let db_conn = Arc::new(Mutex::new(
         <dyn Connection>::open(
             Storage::Postgres,
             Some("sql/postgres.sql".to_owned()),
-            Some(db.connection_uri()),
+            Some(connection_uri.to_owned()),
             None,
             None,
         )
@@ -35,7 +36,7 @@ async fn test_postgres_new_stream_and_event() -> anyhow::Result<()> {
 
     // Insert new event to that stream
     let payload = json!(
-    {"this": "is", "a": "test", "payload": "for", "the": "new", "stream": "id"}
+        {"this": "is", "a": "test", "payload": "for", "the": "new", "stream": "id"}
     );
     db_conn
         .lock()
@@ -45,7 +46,7 @@ async fn test_postgres_new_stream_and_event() -> anyhow::Result<()> {
         .expect("inserting event");
 
     // Assert that the event was inserted
-    let (client, conn) = tokio_postgres::connect(&db.connection_uri(), NoTls).await?;
+    let (client, conn) = tokio_postgres::connect(&connection_uri, NoTls).await?;
     tokio::spawn(async move {
         if let Err(err) = conn.await {
             error!(%err, "postgres connection failed");
@@ -56,7 +57,7 @@ async fn test_postgres_new_stream_and_event() -> anyhow::Result<()> {
         .await
         .expect("querying events");
     assert_eq!(events.len(), 1);
-    let event = events.get(0).expect("event row but found none");
+    let event = events.first().expect("event row but found none");
     assert_eq!(event.get::<_, i32>("stream_event_index"), 0);
     assert_eq!(event.get::<_, i32>("stream_id"), 1);
     assert_eq!(event.get::<_, serde_json::Value>("payload"), payload);
