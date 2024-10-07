@@ -12,9 +12,8 @@ async fn test_postgres_new_stream_and_event() -> anyhow::Result<()> {
     let connection_uri = db.connection_uri();
     let db_conn = Arc::new(Mutex::new(
         PostgresOpener {
-            schema_path: Some("sql/postgres.sql".to_owned()),
-
-            conn_str: Some(connection_uri.to_owned()),
+            schema_path: "sql/postgres.sql".to_owned(),
+            conn_str: connection_uri.to_owned(),
             tls_cert_path: None,
         }
         .open()

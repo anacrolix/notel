@@ -110,9 +110,9 @@ impl StorageOpen for JsonFilesOpen {
 #[derive(Clone, clap::Args)]
 pub(crate) struct PostgresOpener {
     #[arg(long)]
-    pub schema_path: Option<String>,
+    pub schema_path: String,
     #[arg(long)]
-    pub conn_str: Option<String>,
+    pub conn_str: String,
     #[arg(long)]
     pub tls_cert_path: Option<String>,
 }
@@ -130,7 +130,7 @@ impl StorageOpen for PostgresOpener {
             let client = match tls_cert_path {
                 None => {
                     debug!("Initializing postgres storage without TLS");
-                    let (client, conn) = tokio_postgres::connect(&conn_str.unwrap(), NoTls).await?;
+                    let (client, conn) = tokio_postgres::connect(&conn_str, NoTls).await?;
                     tokio::spawn(async move {
                         if let Err(err) = conn.await {
                             error!(%err, "postgres connection failed");
@@ -145,7 +145,7 @@ impl StorageOpen for PostgresOpener {
                     let connector = TlsConnector::builder().add_root_certificate(cert).build()?;
                     let connector = MakeTlsConnector::new(connector);
                     let (client, conn) =
-                        tokio_postgres::connect(&conn_str.unwrap(), connector).await?;
+                        tokio_postgres::connect(&conn_str, connector).await?;
                     tokio::spawn(async move {
                         if let Err(err) = conn.await {
                             error!(%err, "postgres connection failed");
@@ -156,7 +156,7 @@ impl StorageOpen for PostgresOpener {
             };
             // Init DB schema
             client
-                .batch_execute(fs::read_to_string(schema_path.unwrap())?.as_str())
+                .batch_execute(fs::read_to_string(schema_path)?.as_str())
                 .await?;
             Postgres { client }
         })
