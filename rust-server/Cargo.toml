@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+pgtemp = "0.5.0"
+native-tls = "0.2.12"
+postgres-native-tls = "0.5.0"
+tokio-postgres = { version = "0.7.12", features = ["with-serde_json-1", "with-chrono-0_4"] }
 anyhow = "1.0.86"
 axum = { version = "0.7.5", features = ["ws"] }
 chrono = "0.4.38"

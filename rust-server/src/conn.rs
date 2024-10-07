@@ -1,9 +1,13 @@
 use super::*;
 use axum::async_trait;
 use chrono::Utc;
+use native_tls::{Certificate, TlsConnector};
+use postgres_native_tls::MakeTlsConnector;
 use rand::random;
 use serde_json::json;
+use std::fs;
 use tempfile::NamedTempFile;
+use tokio_postgres::{Client, NoTls};
 
 #[async_trait]
 pub(crate) trait Connection: Send {
@@ -26,10 +30,18 @@ pub(crate) trait Connection: Send {
 }
 
 impl dyn Connection {
-    pub(crate) fn open(storage: Storage) -> Result<Box<dyn Connection + Send>> {
+    pub(crate) async fn open(
+        storage: Storage,
+        schema_path: Option<String>,
+        conn_str: Option<String>,
+        db_dir_path: Option<String>,
+        tls_cert_path: Option<String>,
+    ) -> Result<Box<dyn Connection + Send>> {
         Ok(match storage {
             Storage::Sqlite => Box::new({
-                let mut conn = rusqlite::Connection::open("telemetry.db")?;
+                let db_path = db_dir_path.unwrap() + "/telemetry.sqlite.db";
+                let schema_contents = fs::read_to_string(schema_path.unwrap())?;
+                let mut conn = rusqlite::Connection::open(db_path)?;
                 conn.pragma_update(None, "foreign_keys", "on")?;
                 if !conn.pragma_query_value(None, "foreign_keys", |row| row.get(0))? {
                     warn!("foreign keys not enabled");
@@ -38,16 +50,18 @@ impl dyn Connection {
                 let user_version: u64 =
                     tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
                 if user_version == 0 {
-                    tx.execute_batch(include_str!("../sql/sqlite.sql"))?;
+                    tx.execute_batch(&schema_contents)?;
                     tx.pragma_update(None, "user_version", 1)?;
                 }
                 tx.commit()?;
                 conn
             }),
             Storage::DuckDB => Box::new({
-                let mut conn = duckdb::Connection::open("duck.db")?;
+                let db_path = db_dir_path.unwrap() + "/duck.db";
+                let schema_contents = fs::read_to_string(schema_path.unwrap())?;
+                let mut conn = duckdb::Connection::open(db_path)?;
                 let tx = conn.transaction()?;
-                if let Err(err) = tx.execute_batch(include_str!("../sql/duckdb.sql")) {
+                if let Err(err) = tx.execute_batch(&schema_contents) {
                     warn!(%err, "initing duckdb schema (haven't figured out user_version yet)");
                 }
                 tx.commit()?;
@@ -59,7 +73,101 @@ impl dyn Connection {
                 let events = JsonFileWriter::new("events".to_owned()).context("opening events")?;
                 JsonFiles { streams, events }
             }),
+            Storage::Postgres => Box::new({
+                let client = match tls_cert_path {
+                    None => {
+                        debug!("Initializing postgres storage without TLS");
+                        let (client, conn) =
+                            tokio_postgres::connect(&conn_str.unwrap(), NoTls).await?;
+                        tokio::spawn(async move {
+                            if let Err(err) = conn.await {
+                                error!(%err, "postgres connection failed");
+                            }
+                        });
+                        client
+                    }
+                    Some(tls_cert_path) => {
+                        debug!("Initializing postgres storage with TLS");
+                        let cert = fs::read(tls_cert_path)?;
+                        let cert = Certificate::from_pem(&cert)?;
+                        let connector =
+                            TlsConnector::builder().add_root_certificate(cert).build()?;
+                        let connector = MakeTlsConnector::new(connector);
+                        let (client, conn) =
+                            tokio_postgres::connect(&conn_str.unwrap(), connector).await?;
+                        tokio::spawn(async move {
+                            if let Err(err) = conn.await {
+                                error!(%err, "postgres connection failed");
+                            }
+                        });
+                        client
+                    }
+                };
+                // Init DB schema
+                client
+                    .batch_execute(fs::read_to_string(schema_path.unwrap())?.as_str())
+                    .await?;
+                Postgres { client }
+            }),
         })
+    }
+}
+
+struct Postgres {
+    client: Client,
+}
+
+#[async_trait]
+impl Connection for Postgres {
+    async fn new_stream(&mut self, headers_value: SerializedHeaders) -> Result<StreamId> {
+        let stmt = self
+            .client
+            .prepare(
+                "INSERT INTO streams (headers, start_datetime) VALUES ($1, NOW()) RETURNING stream_id",
+            )
+            .await?;
+        let stream_id: i32 = self
+            .client
+            .query_one(&stmt, &[&headers_value])
+            .await?
+            .get(0);
+        Ok(StreamId(stream_id as u32))
+    }
+
+    async fn insert_event(
+        &mut self,
+        stream_id: StreamId,
+        stream_event_index: StreamEventIndex,
+        payload: &str,
+    ) -> Result<()> {
+        let payload_value: serde_json::Value = serde_json::from_str(payload)?;
+        let stmt = self
+            .client
+            .prepare(
+                "INSERT INTO events (insert_datetime, stream_event_index, payload, stream_id) VALUES (NOW(), $1, $2, $3)",
+            )
+            .await?;
+        self.client
+            .execute(
+                &stmt,
+                &[
+                    &(stream_event_index as i32),
+                    &payload_value,
+                    &(stream_id.0 as i32),
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn flush(&mut self) -> Result<()> {
+        // Not necessary for Postgres
+        Ok(())
+    }
+
+    async fn commit(&mut self) -> Result<()> {
+        // Not necessary for Postgres
+        Ok(())
     }
 }
 
@@ -249,6 +357,12 @@ impl Connection for JsonFiles {
 impl Drop for JsonFiles {
     fn drop(&mut self) {
         let mut conn = self.take();
-        tokio::spawn(async move { log_commit(&mut conn).await.unwrap() });
+        tokio::spawn(async move {
+            if let Err(err) = conn.commit().await {
+                error!(%err, "logging commit");
+            } else {
+                info!("committed");
+            }
+        });
     }
 }

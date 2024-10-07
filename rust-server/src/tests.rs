@@ -1,6 +1,67 @@
+use super::*;
 use crate::{headers_to_json_value, iter_json_stream};
 use axum::http::HeaderMap;
+use pgtemp::PgTempDB;
 use serde_json::json;
+use tokio_postgres::NoTls;
+
+#[tokio::test]
+async fn test_postgres_new_stream_and_event() -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let db = PgTempDB::async_new().await;
+    let db_conn = Arc::new(Mutex::new(
+        <dyn Connection>::open(
+            Storage::Postgres,
+            Some("sql/postgres.sql".to_owned()),
+            Some(db.connection_uri()),
+            None,
+            None,
+        )
+        .await
+        .expect("opening test postgres db"),
+    ));
+
+    let headers = json!({
+        "some": "headers",
+        "some_more": "headers",
+    });
+    let stream_id = db_conn
+        .lock()
+        .await
+        .new_stream(headers)
+        .await
+        .expect("new stream");
+    assert_eq!(stream_id.0, 1);
+
+    // Insert new event to that stream
+    let payload = json!(
+    {"this": "is", "a": "test", "payload": "for", "the": "new", "stream": "id"}
+    );
+    db_conn
+        .lock()
+        .await
+        .insert_event(stream_id, 0, &payload.to_string())
+        .await
+        .expect("inserting event");
+
+    // Assert that the event was inserted
+    let (client, conn) = tokio_postgres::connect(&db.connection_uri(), NoTls).await?;
+    tokio::spawn(async move {
+        if let Err(err) = conn.await {
+            error!(%err, "postgres connection failed");
+        }
+    });
+    let events = client
+        .query("SELECT * FROM events", &[])
+        .await
+        .expect("querying events");
+    assert_eq!(events.len(), 1);
+    let event = events.get(0).expect("event row but found none");
+    assert_eq!(event.get::<_, i32>("stream_event_index"), 0);
+    assert_eq!(event.get::<_, i32>("stream_id"), 1);
+    assert_eq!(event.get::<_, serde_json::Value>("payload"), payload);
+    Ok(())
+}
 
 #[test]
 fn test_headers_to_json() -> anyhow::Result<()> {
