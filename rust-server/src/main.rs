@@ -4,7 +4,7 @@ mod tests;
 mod conn;
 mod stream_id;
 
-use conn::Connection;
+use conn::*;
 use stream_id::StreamId;
 
 use anyhow::{anyhow, Context, Result};
@@ -26,44 +26,31 @@ use std::task::Poll;
 use tokio::signal::unix::SignalKind;
 use tokio::sync::Mutex;
 use tracing::*;
+use Error::*;
 
 #[derive(clap::Parser)]
 struct Args {
-    #[arg(long)]
-    #[clap(value_enum, default_value_t=Storage::JsonFiles)]
+    #[command(subcommand)]
     storage: Storage,
-
-    /// Path to the directory where the database file(s) will be created
-    #[arg(long)]
-    #[clap(required_if_eq("storage", "Sqlite"))]
-    #[clap(required_if_eq("storage", "DuckDB"))]
-    #[clap(required_if_eq("storage", "JsonFiles"))]
-    db_dir_path: Option<String>,
-
-    /// Schema file path
-    #[arg(long)]
-    #[clap(required_if_eq("storage", "Sqlite"))]
-    #[clap(required_if_eq("storage", "DuckDB"))]
-    #[clap(required_if_eq("storage", "Postgres"))]
-    schema_path: Option<String>,
-
-    /// Connection string for the database
-    #[arg(long)]
-    #[clap(required_if_eq("storage", "Postgres"))]
-    conn_str: Option<String>,
-
-    /// Path to the TLS certificate file
-    #[arg(long)]
-    #[clap(required_if_eq("storage", "Postgres"))]
-    tls_cert_path: Option<String>,
 }
 
-#[derive(Clone, clap::ValueEnum)]
+#[derive(Clone, clap::Subcommand)]
 enum Storage {
-    Sqlite,
-    DuckDB,
-    JsonFiles,
-    Postgres,
+    Sqlite(SqliteOpen),
+    DuckDB(DuckDbOpen),
+    JsonFiles(JsonFilesOpen),
+    Postgres(PostgresOpener),
+}
+
+impl Storage {
+    pub(crate) async fn open(self) -> Result<Box<dyn Connection + Send>> {
+        match self {
+            Storage::Sqlite(open) => Ok(Box::new(open.open().await?)),
+            Storage::DuckDB(open) => Ok(Box::new(open.open().await?)),
+            Storage::JsonFiles(open) => Ok(Box::new(open.open().await?)),
+            Storage::Postgres(open) => Ok(Box::new(open.open().await?)),
+        }
+    }
 }
 
 #[tokio::main]
@@ -84,16 +71,7 @@ async fn main() -> Result<()> {
         .init();
     debug!(test_arg = "hi mum", "debug level test");
     let args = Args::parse();
-    let db_conn = Arc::new(Mutex::new(
-        <dyn Connection>::open(
-            args.storage,
-            args.schema_path,
-            args.conn_str,
-            args.db_dir_path,
-            args.tls_cert_path,
-        )
-        .await?,
-    ));
+    let db_conn = Arc::new(Mutex::new(args.storage.open().await?));
     let onexit = {
         let db_conn = Arc::clone(&db_conn);
         move || async move {
@@ -258,8 +236,6 @@ impl Display for Error {
         }
     }
 }
-
-use Error::*;
 
 impl Server {
     async fn websocket_handler(&self, websocket: WebSocket, headers: &HeaderMap) {

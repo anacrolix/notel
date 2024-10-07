@@ -1,4 +1,5 @@
 use super::*;
+use crate::conn::PostgresOpener;
 use crate::{headers_to_json_value, iter_json_stream};
 use axum::http::HeaderMap;
 use pgtemp::PgTempDB;
@@ -11,13 +12,13 @@ async fn test_postgres_new_stream_and_event() -> anyhow::Result<()> {
     let db = PgTempDB::async_new().await;
     let connection_uri = db.connection_uri();
     let db_conn = Arc::new(Mutex::new(
-        <dyn Connection>::open(
-            Storage::Postgres,
-            Some("sql/postgres.sql".to_owned()),
-            Some(connection_uri.to_owned()),
-            None,
-            None,
-        )
+        PostgresOpener {
+            schema_path: Some("sql/postgres.sql".to_owned()),
+
+            conn_str: Some(connection_uri.to_owned()),
+            tls_cert_path: None,
+        }
+        .open()
         .await
         .expect("opening test postgres db"),
     ));
