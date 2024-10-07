@@ -1,0 +1,20 @@
+Run Postgres in Docker:
+```
+docker run --name test \
+  -e POSTGRES_USERNAME=postgres \
+  -e POSTGRES_PASSWORD=postgres \
+  -d \
+  -p 5432:5432 \
+  postgres:16
+```
+
+Then run the server with
+
+```
+RUST_BACKTRACE=1 RUST_LOG=debug cargo run -- \
+  --storage postgres \
+  --schema-path sql/postgres.sql \
+  --conn-str "postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable"
+```
+
+The tests can run against Docker if you set the connection string to `postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable`.
