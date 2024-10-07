@@ -1,5 +1,4 @@
 use super::*;
-use crate::conn::PostgresOpener;
 use crate::{headers_to_json_value, iter_json_stream};
 use axum::http::HeaderMap;
 use pgtemp::PgTempDB;

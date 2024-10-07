@@ -44,12 +44,22 @@ enum Storage {
 
 impl Storage {
     pub(crate) async fn open(self) -> Result<Box<dyn Connection + Send>> {
+        // Moving the box/dyn stuff into the trait doesn't seem better. Rust doesn't let me dispatch
+        // over enums that all implement the same trait?
         match self {
-            Storage::Sqlite(open) => Ok(Box::new(open.open().await?)),
-            Storage::DuckDB(open) => Ok(Box::new(open.open().await?)),
-            Storage::JsonFiles(open) => Ok(Box::new(open.open().await?)),
-            Storage::Postgres(open) => Ok(Box::new(open.open().await?)),
+            Storage::Sqlite(open) => Self::do_open(open).await,
+            Storage::DuckDB(open) => Self::do_open(open).await,
+            Storage::JsonFiles(open) => Self::do_open(open).await,
+            Storage::Postgres(open) => Self::do_open(open).await,
         }
+    }
+
+    async fn do_open<O>(opener: O) -> Result<Box<dyn Connection + Send>>
+    where
+        O: StorageOpen,
+        <O as StorageOpen>::Conn: Connection + 'static,
+    {
+        Ok(Box::new(opener.open().await?))
     }
 }
 
