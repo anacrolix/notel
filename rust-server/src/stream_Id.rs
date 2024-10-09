@@ -18,27 +18,3 @@ impl Deref for StreamId {
         &self.0
     }
 }
-
-impl rusqlite::types::FromSql for StreamId {
-    fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
-        Ok(Self(rusqlite::types::FromSql::column_result(value)?))
-    }
-}
-
-impl rusqlite::types::ToSql for StreamId {
-    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
-        rusqlite::types::ToSql::to_sql(&self.0)
-    }
-}
-
-impl duckdb::types::FromSql for StreamId {
-    fn column_result(value: duckdb::types::ValueRef<'_>) -> duckdb::types::FromSqlResult<Self> {
-        Ok(Self(duckdb::types::FromSql::column_result(value)?))
-    }
-}
-
-impl duckdb::types::ToSql for StreamId {
-    fn to_sql(&self) -> duckdb::Result<duckdb::types::ToSqlOutput<'_>> {
-        duckdb::types::ToSql::to_sql(&self.0)
-    }
-}

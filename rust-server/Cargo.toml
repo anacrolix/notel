@@ -4,25 +4,35 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-pgtemp = "0.5.0"
-native-tls = "0.2.12"
-postgres-native-tls = "0.5.0"
-tokio-postgres = { version = "0.7.12", features = ["with-serde_json-1", "with-chrono-0_4"] }
-anyhow = "1.0.86"
+
 axum = { version = "0.7.5", features = ["ws"] }
-chrono = "0.4.38"
-clap = { version = "4.5.13", features = ["derive"] }
-duckdb = { version = "1.0.0", features = ["json", "serde_json"] }
-env_logger = "0.11.3"
-futures = "0.3.30"
-http-serde = "2.1.1"
-rusqlite = { version = "0.31.0", features = ["bundled", "serde_json"] }
-serde = "1.0.203"
-serde_json = "1.0.117"
-tempfile = "3.12.0"
+anyhow = "1.0.86"
+tracing = "0.1.40"
 tokio = { version = "1.38.0", features = ["rt-multi-thread", "signal"] }
 tokio-util = { version = "0.7.11", features = ["io", "io-util"] }
 tower-http = { version = "0.5.2", features = ["trace"] }
-tracing = "0.1.40"
-zstd = "0.13.2"
-rand = "0.8.5"
+futures = { version = "0.3.30" }
+env_logger = { version = "0.11.3" }
+serde = { version = "1.0.203" }
+serde_json = { version = "1.0.117" }
+chrono = { version = "0.4.38" }
+http-serde = { version = "2.1.1" }
+cfg-if = "1.0.0"
+
+native-tls = { version = "0.2.12", optional = true }
+postgres-native-tls = { version = "0.5.0", optional = true }
+tokio-postgres = { version = "0.7.12", features = ["with-serde_json-1", "with-chrono-0_4"] }
+clap = { version = "4.5.13", features = ["derive"] }
+duckdb = { version = "1.0.0", features = ["json", "serde_json"], optional = true }
+rusqlite = { version = "0.31.0", features = ["bundled", "serde_json"], optional = true }
+tempfile = { version = "3.12.0", optional = true }
+zstd = { version = "0.13.2", optional = true }
+rand = { version = "0.8.5", optional = true }
+
+[dev-dependencies]
+pgtemp = { version = "0.5.0" }
+
+[features]
+default = ["postgres", "local"]
+postgres = ["dep:native-tls", "dep:postgres-native-tls"]
+local = ["dep:rand", "dep:tempfile", "dep:duckdb", "dep:rusqlite", "dep:zstd"]

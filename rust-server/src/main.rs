@@ -1,18 +1,17 @@
 #[cfg(test)]
 mod tests;
-
 mod conn;
 mod stream_id;
 
 use conn::*;
 use stream_id::StreamId;
+use Error::*;
 
 use anyhow::{anyhow, Context, Result};
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::WebSocketUpgrade;
 use axum::http::{HeaderMap, StatusCode};
-use chrono::SecondsFormat;
 use clap::Parser;
 use futures::FutureExt;
 use futures::{future, select_biased, TryFutureExt};
@@ -27,7 +26,6 @@ use tokio::signal::ctrl_c;
 use tokio::signal::unix::SignalKind;
 use tokio::sync::Mutex;
 use tracing::*;
-use Error::*;
 
 #[derive(clap::Parser)]
 struct Args {
@@ -37,10 +35,14 @@ struct Args {
 
 #[derive(Clone, clap::Subcommand)]
 enum Storage {
-    Sqlite(SqliteOpen),
-    DuckDB(DuckDbOpen),
-    JsonFiles(JsonFilesOpen),
-    Postgres(PostgresOpener),
+    #[cfg(feature = "local")]
+    Sqlite(local::SqliteOpen),
+    #[cfg(feature = "local")]
+    DuckDB(local::DuckDbOpen),
+    #[cfg(feature = "local")]
+    JsonFiles(local::JsonFilesOpen),
+    #[cfg(feature = "postgres")]
+    Postgres(postgres::PostgresOpener),
 }
 
 impl Storage {
@@ -48,9 +50,13 @@ impl Storage {
         // Moving the box/dyn stuff into the trait doesn't seem better. Rust doesn't let me dispatch
         // over enums that all implement the same trait?
         match self {
+            #[cfg(feature = "local")]
             Storage::Sqlite(open) => Self::do_open(open).await,
+            #[cfg(feature = "local")]
             Storage::DuckDB(open) => Self::do_open(open).await,
+            #[cfg(feature = "local")]
             Storage::JsonFiles(open) => Self::do_open(open).await,
+            #[cfg(feature = "postgres")]
             Storage::Postgres(open) => Self::do_open(open).await,
         }
     }
@@ -498,14 +504,3 @@ fn headers_to_json_value(headers: &HeaderMap) -> serde_json::Result<serde_json::
     // valid objects.
     http_serde::header_map::serialize(headers, serde_json::value::Serializer)
 }
-
-#[allow(dead_code)]
-fn sqlite_local_datetime_now_string() -> String {
-    chrono::Local::now().to_rfc3339_opts(SecondsFormat::Millis, false)
-}
-
-// enum Payload {
-//     Binary,
-//     Text,
-//     Json,
-// }
