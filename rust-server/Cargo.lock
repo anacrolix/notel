@@ -1979,35 +1979,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "cfg-if",
- "chrono",
- "clap",
- "duckdb",
- "env_logger",
- "futures",
- "http-serde",
- "native-tls",
- "pgtemp",
- "postgres-native-tls",
- "rand",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-postgres",
- "tokio-util",
- "tower-http",
- "tracing",
- "zstd",
-]
-
-[[package]]
 name = "sha1"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2212,6 +2183,35 @@ dependencies = [
  "filetime",
  "libc",
  "xattr",
+]
+
+[[package]]
+name = "telemetry-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "cfg-if",
+ "chrono",
+ "clap",
+ "duckdb",
+ "env_logger",
+ "futures",
+ "http-serde",
+ "native-tls",
+ "pgtemp",
+ "postgres-native-tls",
+ "rand",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-postgres",
+ "tokio-util",
+ "tower-http",
+ "tracing",
+ "zstd",
 ]
 
 [[package]]
