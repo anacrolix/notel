@@ -2,6 +2,8 @@
 name = "telemetry-server"
 version = "0.1.0"
 edition = "2021"
+description = "Simple receiver of telemetry over HTTP POST/WS to sqlite3, Postgres, DuckDB or JSON files"
+license = "MPL-2.0"
 
 [dependencies]
 
