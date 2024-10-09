@@ -19,12 +19,6 @@ struct JsonFileWriter {
 }
 
 impl JsonFileWriter {
-    fn take(&mut self) -> Self {
-        Self {
-            w: self.w.take(),
-            table: std::mem::take(&mut self.table),
-        }
-    }
     fn new(table: String) -> anyhow::Result<Self> {
         Ok(Self { w: None, table })
     }
@@ -135,15 +129,6 @@ pub struct JsonFiles {
     events: JsonFileWriter,
 }
 
-impl JsonFiles {
-    fn take(&mut self) -> Self {
-        Self {
-            streams: self.streams.take(),
-            events: self.events.take(),
-        }
-    }
-}
-
 fn json_datetime_now() -> serde_json::Value {
     json!(Utc::now().to_rfc3339())
 }
@@ -189,7 +174,7 @@ impl Connection for JsonFiles {
         Ok(())
     }
 
-    async fn commit(&mut self) -> anyhow::Result<()> {
+    fn commit(&mut self) -> Result<()> {
         self.streams.finish_file()?;
         self.events.finish_file()?;
         Ok(())
@@ -202,8 +187,7 @@ impl Connection for JsonFiles {
 
 impl Drop for JsonFiles {
     fn drop(&mut self) {
-        let mut conn = self.take();
-        tokio::spawn(async move { log_commit(&mut conn).await.unwrap() });
+        log_commit(self).unwrap();
     }
 }
 

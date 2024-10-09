@@ -1,7 +1,7 @@
-#[cfg(test)]
-mod tests;
 mod conn;
 mod stream_id;
+#[cfg(test)]
+mod tests;
 
 use conn::*;
 use stream_id::StreamId;
@@ -103,7 +103,7 @@ async fn main() -> Result<()> {
             }
             loop {
                 ctrl_c().await.unwrap();
-                log_commit(&mut **db_conn.lock().await).await.unwrap();
+                log_commit(&mut **db_conn.lock().await).unwrap();
             }
         }
     });
@@ -173,8 +173,8 @@ fn signal(name: &str, kind: SignalKind) -> Result<impl Future<Output = (&str, Op
     Ok(async move { signal.recv().map(|maybe_sig| (name, maybe_sig)).await })
 }
 
-async fn log_commit(conn: &mut (impl Connection + ?Sized)) -> Result<()> {
-    let res = conn.commit().await;
+fn log_commit(conn: &mut (impl Connection + ?Sized)) -> Result<()> {
+    let res = conn.commit();
     match &res {
         Ok(()) => info!("committed"),
         Err(err) => error!(%err, "committing"),

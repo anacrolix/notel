@@ -21,7 +21,7 @@ pub(crate) trait Connection: Send {
         Ok(())
     }
     // Make data available to observers.
-    async fn commit(&mut self) -> Result<()> {
+    fn commit(&mut self) -> Result<()> {
         Ok(())
     }
     /// Whether sigint should be hooked to trigger a commit. Some storage types buffer output and
