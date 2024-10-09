@@ -2,7 +2,7 @@
 
 The project contains simple components relating to telemetry. There is a client package for Go which provides a way to send telemetry data, and a server program to receive and store that data.
 
-The implementation can be self-hosted. It doesn't specify a data format. The examples use JSON event payloads, websocket and HTTP POST as transports, and sqlite3 for storage. All of these choices are easily replaced or modified.
+The implementation can be self-hosted. It doesn't specify a data format. The examples use JSON event payloads, websocket and HTTP POST as transports, and sqlite3/duckdb/json-files with duckdb view, or Postgres for storage. All of these choices are easily replaced, modified or extended.
 
 Due to the simplicity of the transport protocol, it should be trivial to send telemetry from any language or web client interface (like cURL).
 
@@ -15,7 +15,7 @@ Telemetry refers to the collection, transmission and storage of data generated b
 Run the server
 
     cd rust-server
-    RUST_LOG=debug cargo run
+    RUST_LOG=debug cargo run -- sqlite
 
 The server is now listening on port 4318.
 
@@ -24,7 +24,7 @@ Send some telemetry to the server. See the [Go client demo code](go/cmd/demo/mai
     cd go
     go run ./cmd/demo
 
-Look in the `telemetry.db` file for your data:
+Look in the `telemetry.db` file for your data. Note the below is for the sqlite backend, there are others:
 
     sqlite3 rust-server/telemetry.db
     sqlite> select json_pretty(headers) from streams;
@@ -86,9 +86,7 @@ telemetry is ready for use now. If there are changes in the future, migration sh
 
 Here are some ideas for future development:
 
-- Switch from SQLite to DuckDB. SQLite is designed for OLTP, and DuckDB for OLAP and probably much better suited to performing analytical queries on the data.
-
-- Provide a way to stream events from the database. That way you can stream to the database then have a live view of your application.
+- Provide a way to stream events from the database. That way you can stream to the database then have a live view of your application. Most backends support committing immediately. The json-files backend has a commit trigger if you need to synchronize events/streams for consumption.
 
 - Provide a [tracing subscriber](https://tracing.rs/tracing_subscriber/index.html) for Rust (for the [tracing crate](https://tracing.rs/tracing/)) that sends telemetry to the server in this implementation. Note that this handles conventional tracing and log concepts in one. This does not require OpenTelemetry! Find something similar for Go for tracing that isn't related to OpenTelemetry.
 

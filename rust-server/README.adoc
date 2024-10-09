@@ -1,1 +1,7 @@
-The server receives POSTs of distinct JSON objects that are injected directly into the sqlite database using sqlite3's JSONB support.
+The server receives POSTs, or streams of messages over websocket of distinct JSON objects that are injected directly into the backend storage implementation.
+
+There are several implementations:
+ * sqlite using sqlite3's JSONB support
+ * duckdb
+ * json-files, committing zstd compressed files that are intended to be consumed using a duckdb database using views.
+ * [postgres](POSTGRES.adoc), contributed by @afjoseph.

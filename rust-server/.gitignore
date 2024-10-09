@@ -2,3 +2,5 @@
 /json_files
 /telemetry.db
 /telemetry.db-*
+/duckdb-json-files-*
+/duck.db
