@@ -78,11 +78,11 @@ The Websocket transport treats each text and binary message a distinct event (no
 
 The HTTP POST transport sends newline delimited JSON body. The rust-server streams them straight into the attached database. When the stream ends it replies with the number of events received. Note that it currently expects JSON because it needs to be able to separate events in the incoming stream. This could be relaxed to newlines, or interpreted from the Content-Type in the future.
 
-The existing transports stream back the cumulative count of consecutive events received from the client and inserted into the store so that future clients might have retry or batching logic.
+The existing transports stream back the cumulative count of consecutive events received from the client and inserted into the store so that clients can implement retry or batching logic.
 
 # What's next?
 
-telemetry is ready for use now. If there are changes in the future, migration should not be complex due to the simplicity of the design, or you can just fork and do things your own way.
+notel is ready for use now. If there are changes in the future, migration should not be complex due to the simplicity of the design, or you can just fork and do things your own way.
 
 Here are some ideas for future development:
 
